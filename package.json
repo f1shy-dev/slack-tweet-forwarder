@@ -1,0 +1,20 @@
+{
+  "name": "slack-tweet-forwarder",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "tsc --noEmit",
+    "lint": "oxlint .",
+    "format": "oxfmt --write ."
+  },
+  "devDependencies": {
+    "oxfmt": "^0.54.0",
+    "oxlint": "^1.69.0",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.100.0"
+  },
+  "packageManager": "pnpm@10.31.0"
+}
