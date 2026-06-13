@@ -38,14 +38,28 @@ x_request() {
   local body=${3:-}
   local response
   local status
+  local curl_status
   response=$(mktemp)
 
+  set +e
   if [[ -n "$body" ]]; then
     status=$(curl --silent --show-error --output "$response" --write-out "%{http_code}" \
       "${auth[@]}" "${json[@]}" -X "$method" "$url" -d "$body")
+    curl_status=$?
   else
     status=$(curl --silent --show-error --output "$response" --write-out "%{http_code}" \
       "${auth[@]}" -X "$method" "$url")
+    curl_status=$?
+  fi
+  set -e
+
+  if (( curl_status != 0 )); then
+    echo "X API request failed before receiving an HTTP response: $method $url" >&2
+    if [[ -s "$response" ]]; then
+      cat "$response" >&2
+    fi
+    rm -f "$response"
+    exit 1
   fi
 
   if (( status < 200 || status >= 300 )); then
