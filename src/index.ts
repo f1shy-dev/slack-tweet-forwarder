@@ -173,6 +173,12 @@ function candidatesFromAccountActivity(value: unknown): Array<PostCandidate> {
 }
 
 function candidatesFromActivityPayload(payload: unknown, depth = 0): Array<PostCandidate> {
+  if (Array.isArray(payload)) {
+    return mergeCandidates(
+      payload.flatMap((item) => candidatesFromActivityPayload(item, depth + 1)),
+    );
+  }
+
   const candidates: Array<PostCandidate | null> = [
     candidateFromFilteredStream(payload),
     candidateFromTweetObject(payload),
@@ -186,7 +192,7 @@ function candidatesFromActivityPayload(payload: unknown, depth = 0): Array<PostC
     candidates.push(candidateFromTweetObject(event, idField(payload, "for_user_id")));
   }
 
-  for (const key of ["payload", "post", "tweet", "status", "data"]) {
+  for (const key of ["payload", "post", "tweet", "status", "data", "events"]) {
     const nested: unknown = payload[key];
     if (nested !== undefined && nested !== payload) {
       candidates.push(...candidatesFromActivityPayload(nested, depth + 1));
@@ -205,12 +211,17 @@ function candidatesFromActivityEvent(value: unknown): Array<PostCandidate> {
     return [];
   }
 
-  const data = recordField(value, "data");
-  if (data === null || !isPostCreateEventType(stringField(data, "event_type"))) {
+  const dataValue = value.data;
+  if (Array.isArray(dataValue)) {
+    return mergeCandidates(dataValue.flatMap((item) => candidatesFromActivityEvent(item)));
+  }
+
+  const data = recordField(value, "data") ?? value;
+  if (!isPostCreateEventType(stringField(data, "event_type"))) {
     return [];
   }
 
-  return candidatesFromActivityPayload(data.payload);
+  return candidatesFromActivityPayload(data.payload ?? data);
 }
 
 function candidatesFromWebhookEvent(value: unknown): Array<PostCandidate> {
@@ -219,6 +230,22 @@ function candidatesFromWebhookEvent(value: unknown): Array<PostCandidate> {
     ...candidatesFromAccountActivity(value),
     ...candidatesFromActivityEvent(value),
   ]);
+}
+
+function describeEvent(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) {
+    return { type: typeof value };
+  }
+
+  const data = recordField(value, "data");
+  return {
+    keys: Object.keys(value).slice(0, 12),
+    dataKeys: data === null ? [] : Object.keys(data).slice(0, 12),
+    eventType:
+      stringField(value, "event_type") ?? (data === null ? null : stringField(data, "event_type")),
+    hasTweetCreateEvents: Array.isArray(value.tweet_create_events),
+    hasMatchingRules: Array.isArray(value.matching_rules),
+  };
 }
 
 async function importHmacKey(secret: string): Promise<CryptoKey> {
@@ -527,6 +554,12 @@ export default {
     }
 
     const candidates = candidatesFromWebhookEvent(event);
+    if (candidates.length === 0) {
+      console.warn("Signed X webhook event did not contain a supported post payload", {
+        event: describeEvent(event),
+      });
+    }
+
     for (const next of candidates) {
       ctx.waitUntil(forwardToSlack(next, env));
     }

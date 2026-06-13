@@ -29,21 +29,48 @@ done
 api=https://api.x.com/2
 auth=(-H "Authorization: Bearer $BEARER_TOKEN")
 json=(-H "Content-Type: application/json")
-curl_args=(--fail-with-body --silent --show-error)
 tag=tracked-profiles
 event_type=post.create
+
+x_request() {
+  local method=$1
+  local url=$2
+  local body=${3:-}
+  local response
+  local status
+  response=$(mktemp)
+
+  if [[ -n "$body" ]]; then
+    status=$(curl --silent --show-error --output "$response" --write-out "%{http_code}" \
+      "${auth[@]}" "${json[@]}" -X "$method" "$url" -d "$body")
+  else
+    status=$(curl --silent --show-error --output "$response" --write-out "%{http_code}" \
+      "${auth[@]}" -X "$method" "$url")
+  fi
+
+  if (( status < 200 || status >= 300 )); then
+    echo "X API request failed ($status): $method $url" >&2
+    if [[ -s "$response" ]]; then
+      jq . "$response" >&2 || cat "$response" >&2
+    fi
+    rm -f "$response"
+    exit 1
+  fi
+
+  cat "$response"
+  rm -f "$response"
+}
 
 if [[ "$webhook_ref" =~ ^[0-9]{1,19}$ ]]; then
   webhook_id=$webhook_ref
 elif [[ "$webhook_ref" =~ ^https:// ]]; then
-  webhooks=$(curl "${curl_args[@]}" "${auth[@]}" "$api/webhooks")
+  webhooks=$(x_request GET "$api/webhooks")
   webhook_id=$(jq -r --arg url "$webhook_ref" \
     '[.data[]? | select(.url == $url)][0].id // empty' <<<"$webhooks")
 
   if [[ -z "$webhook_id" ]]; then
     create_payload=$(jq -cn --arg url "$webhook_ref" '{url: $url}')
-    created=$(curl "${curl_args[@]}" "${auth[@]}" "${json[@]}" \
-      -X POST "$api/webhooks" -d "$create_payload")
+    created=$(x_request POST "$api/webhooks" "$create_payload")
     webhook_id=$(jq -r '.id // .data.id // empty' <<<"$created")
   fi
 
@@ -58,7 +85,7 @@ fi
 
 user_ids=()
 for handle in "${handles[@]}"; do
-  user=$(curl "${curl_args[@]}" "${auth[@]}" "$api/users/by/username/$handle")
+  user=$(x_request GET "$api/users/by/username/$handle")
   user_id=$(jq -r '.data.id // empty' <<<"$user")
   if [[ -z "$user_id" ]]; then
     echo "X did not return a user ID for @$handle" >&2
@@ -68,12 +95,11 @@ for handle in "${handles[@]}"; do
 done
 
 desired_ids=$(printf '%s\n' "${user_ids[@]}" | jq -R . | jq -s .)
-subscriptions=$(curl "${curl_args[@]}" "${auth[@]}" "$api/activity/subscriptions")
+subscriptions=$(x_request GET "$api/activity/subscriptions")
 
 while IFS= read -r subscription_id; do
   [[ -z "$subscription_id" ]] && continue
-  curl "${curl_args[@]}" "${auth[@]}" -X DELETE \
-    "$api/activity/subscriptions/$subscription_id" >/dev/null
+  x_request DELETE "$api/activity/subscriptions/$subscription_id" >/dev/null
 done < <(
   jq -r \
     --arg tag "$tag" \
@@ -97,11 +123,13 @@ for index in "${!handles[@]}"; do
   subscription_id=$(jq -r \
     --arg event_type "$event_type" \
     --arg user_id "$user_id" \
+    --arg tag "$tag" \
     --arg webhook_id "$webhook_id" '
       (.data // [])
       | .[]
       | select(.event_type == $event_type)
       | select(.filter.user_id == $user_id)
+      | select((.tag // "") == $tag)
       | select((.webhook_id // "") == $webhook_id)
       | .subscription_id
     ' <<<"$subscriptions" | head -n 1)
@@ -121,13 +149,9 @@ for index in "${!handles[@]}"; do
   if [[ -n "$subscription_id" ]]; then
     update_payload=$(jq -cn --arg tag "$tag" --arg webhook_id "$webhook_id" \
       '{tag: $tag, webhook_id: $webhook_id}')
-    curl "${curl_args[@]}" "${auth[@]}" "${json[@]}" \
-      -X PUT "$api/activity/subscriptions/$subscription_id" \
-      -d "$update_payload" >/dev/null
+    x_request PUT "$api/activity/subscriptions/$subscription_id" "$update_payload" >/dev/null
   else
-    curl "${curl_args[@]}" "${auth[@]}" "${json[@]}" \
-      -X POST "$api/activity/subscriptions" \
-      -d "$payload" >/dev/null
+    x_request POST "$api/activity/subscriptions" "$payload" >/dev/null
   fi
 
   echo "Tracking @$handle ($user_id) via webhook $webhook_id"
