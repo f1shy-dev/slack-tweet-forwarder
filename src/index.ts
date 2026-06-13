@@ -2,53 +2,223 @@ import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { generateText, Output } from "ai";
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 const modelId = "gemini-3.1-flash-lite";
 const dedupeTtlSeconds = 60 * 60 * 24;
-const classificationSystem = [
+const classifierConfigKey = "config:classifier";
+const defaultClassifierPrompt = [
   "Decide whether this X post should be forwarded into the Slack channel.",
   "Choose send for substantive, high-signal posts: product/company updates, launches, incidents, security items, technical analysis, research, release notes, hiring/funding/business news, or other posts likely useful to the team.",
   "Choose skip for low-signal posts: memes, jokes, personal chatter, engagement bait, giveaways, repost prompts, vague replies without context, spam, or anything that does not stand alone.",
   "When uncertain, choose skip.",
 ].join("\n");
 
-type XEvent = {
-  data: {
-    id: string;
-    text: string;
-    author_id: string;
-  };
-  includes: {
-    users: Array<{
-      id: string;
-      name: string;
-      username: string;
-    }>;
-  };
+type PostCandidate = {
+  id: string;
+  text: string | null;
+  username: string | null;
+};
+
+type XPost = {
+  id: string;
+  text: string;
+  username: string;
+};
+
+type ClassifierConfig = {
+  enabled: boolean;
+  prompt: string | null;
+};
+
+const defaultClassifierConfig: ClassifierConfig = {
+  enabled: true,
+  prompt: null,
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function isXEvent(value: unknown): value is XEvent {
-  if (!isRecord(value) || !isRecord(value.data) || !isRecord(value.includes)) {
-    return false;
+function recordField(value: Record<string, unknown>, key: string): Record<string, unknown> | null {
+  const field = value[key];
+  return isRecord(field) ? field : null;
+}
+
+function arrayField(value: Record<string, unknown>, key: string): Array<unknown> {
+  const field = value[key];
+  return Array.isArray(field) ? field : [];
+}
+
+function stringField(value: Record<string, unknown>, key: string): string | null {
+  const field = value[key];
+  return typeof field === "string" && field.length > 0 ? field : null;
+}
+
+function idField(value: Record<string, unknown>, key: string): string | null {
+  const field = value[key];
+  if (typeof field === "string" && field.length > 0) {
+    return field;
   }
 
-  const { data, includes } = value;
-  return (
-    typeof data.id === "string" &&
-    typeof data.text === "string" &&
-    typeof data.author_id === "string" &&
-    Array.isArray(includes.users) &&
-    includes.users.every(
-      (user) =>
-        isRecord(user) &&
-        typeof user.id === "string" &&
-        typeof user.name === "string" &&
-        typeof user.username === "string",
-    )
+  return typeof field === "number" && Number.isSafeInteger(field) ? String(field) : null;
+}
+
+function usernameFromUser(value: unknown): string | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const username = stringField(value, "username") ?? stringField(value, "screen_name");
+  return username?.replace(/^@/, "") ?? null;
+}
+
+function candidate(
+  id: string | null,
+  text: string | null,
+  username: string | null,
+): PostCandidate | null {
+  return id === null ? null : { id, text, username };
+}
+
+function mergeCandidates(candidates: Array<PostCandidate | null>): Array<PostCandidate> {
+  const merged = new Map<string, PostCandidate>();
+  for (const next of candidates) {
+    if (next === null) {
+      continue;
+    }
+
+    const current = merged.get(next.id);
+    merged.set(next.id, {
+      id: next.id,
+      text: current?.text ?? next.text,
+      username: current?.username ?? next.username,
+    });
+  }
+
+  return [...merged.values()];
+}
+
+function candidateFromFilteredStream(value: unknown): PostCandidate | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const data = recordField(value, "data");
+  if (data === null) {
+    return null;
+  }
+
+  const id = idField(data, "id");
+  const text = stringField(data, "text");
+  const authorId = idField(data, "author_id");
+  const includes = recordField(value, "includes");
+  const users = includes === null ? [] : arrayField(includes, "users");
+  const user = users.find(
+    (item) => isRecord(item) && authorId !== null && idField(item, "id") === authorId,
   );
+  const username =
+    usernameFromUser(user) ??
+    usernameFromUser(recordField(data, "user")) ??
+    usernameFromUser(recordField(data, "author"));
+
+  return candidate(id, text, username);
+}
+
+function candidateFromTweetObject(
+  value: unknown,
+  subscribedUserId: string | null = null,
+): PostCandidate | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const user = recordField(value, "user") ?? recordField(value, "author");
+  const userId = isRecord(user) ? (idField(user, "id_str") ?? idField(user, "id")) : null;
+  if (subscribedUserId !== null && userId !== null && subscribedUserId !== userId) {
+    return null;
+  }
+
+  const extendedTweet = recordField(value, "extended_tweet");
+  const id =
+    idField(value, "id_str") ??
+    idField(value, "id") ??
+    idField(value, "post_id") ??
+    idField(value, "tweet_id") ??
+    idField(value, "postId") ??
+    idField(value, "tweetId");
+  const text =
+    (extendedTweet === null ? null : stringField(extendedTweet, "full_text")) ??
+    stringField(value, "full_text") ??
+    stringField(value, "text");
+  const username =
+    usernameFromUser(user) ??
+    stringField(value, "username") ??
+    stringField(value, "screen_name")?.replace(/^@/, "") ??
+    null;
+
+  return candidate(id, text, username);
+}
+
+function candidatesFromAccountActivity(value: unknown): Array<PostCandidate> {
+  if (!isRecord(value)) {
+    return [];
+  }
+
+  const subscribedUserId = idField(value, "for_user_id");
+  return mergeCandidates(
+    arrayField(value, "tweet_create_events").map((event) =>
+      candidateFromTweetObject(event, subscribedUserId),
+    ),
+  );
+}
+
+function candidatesFromActivityPayload(payload: unknown, depth = 0): Array<PostCandidate> {
+  const candidates: Array<PostCandidate | null> = [
+    candidateFromFilteredStream(payload),
+    candidateFromTweetObject(payload),
+  ];
+
+  if (!isRecord(payload) || depth >= 3) {
+    return mergeCandidates(candidates);
+  }
+
+  for (const event of arrayField(payload, "tweet_create_events")) {
+    candidates.push(candidateFromTweetObject(event, idField(payload, "for_user_id")));
+  }
+
+  for (const key of ["payload", "post", "tweet", "status", "data"]) {
+    const nested: unknown = payload[key];
+    if (nested !== undefined && nested !== payload) {
+      candidates.push(...candidatesFromActivityPayload(nested, depth + 1));
+    }
+  }
+
+  return mergeCandidates(candidates);
+}
+
+function isPostCreateEventType(value: string | null): boolean {
+  return value === "post.create" || value === "PostCreate" || value === "tweet.create";
+}
+
+function candidatesFromActivityEvent(value: unknown): Array<PostCandidate> {
+  if (!isRecord(value)) {
+    return [];
+  }
+
+  const data = recordField(value, "data");
+  if (data === null || !isPostCreateEventType(stringField(data, "event_type"))) {
+    return [];
+  }
+
+  return candidatesFromActivityPayload(data.payload);
+}
+
+function candidatesFromWebhookEvent(value: unknown): Array<PostCandidate> {
+  return mergeCandidates([
+    candidateFromFilteredStream(value),
+    ...candidatesFromAccountActivity(value),
+    ...candidatesFromActivityEvent(value),
+  ]);
 }
 
 async function importHmacKey(secret: string): Promise<CryptoKey> {
@@ -104,10 +274,10 @@ function escapeMrkdwn(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
-function slackMessage(event: XEvent, username: string): string {
-  const text = escapeMrkdwn(event.data.text).replaceAll("\n", "\n>");
-  const link = `https://x.com/${encodeURIComponent(username)}/status/${encodeURIComponent(event.data.id)}`;
-  return `*@${escapeMrkdwn(username)}* posted\n>${text}\n${link}`;
+function slackMessage(post: XPost): string {
+  const text = escapeMrkdwn(post.text).replaceAll("\n", "\n>");
+  const link = `https://x.com/${encodeURIComponent(post.username)}/status/${encodeURIComponent(post.id)}`;
+  return `*@${escapeMrkdwn(post.username)}* posted\n>${text}\n${link}`;
 }
 
 function errorMessage(error: unknown): string {
@@ -118,14 +288,103 @@ function dedupeKey(postId: string): string {
   return `post:${postId}`;
 }
 
-function classificationPrompt(event: XEvent, username: string): string {
-  return [`Author: @${username}`, "Post text:", event.data.text].join("\n");
+function postFromCandidate(candidate: PostCandidate): XPost | null {
+  return candidate.text === null || candidate.username === null
+    ? null
+    : {
+        id: candidate.id,
+        text: candidate.text,
+        username: candidate.username,
+      };
+}
+
+async function fetchPost(postId: string, bearerToken: string): Promise<PostCandidate | null> {
+  const url = new URL(`https://api.x.com/2/tweets/${encodeURIComponent(postId)}`);
+  url.searchParams.set("expansions", "author_id");
+  url.searchParams.set("tweet.fields", "author_id,created_at");
+  url.searchParams.set("user.fields", "id,name,username");
+
+  const response = await fetch(url, {
+    headers: { authorization: `Bearer ${bearerToken}` },
+  });
+  if (!response.ok) {
+    throw new Error(`X post lookup returned ${response.status}`);
+  }
+
+  const body: unknown = await response.json();
+  return candidatesFromActivityPayload(body)[0] ?? null;
+}
+
+async function resolvePost(candidate: PostCandidate, bearerToken: string): Promise<XPost | null> {
+  const complete = postFromCandidate(candidate);
+  if (complete !== null) {
+    return complete;
+  }
+
+  const fetched = await fetchPost(candidate.id, bearerToken);
+  if (fetched === null) {
+    return null;
+  }
+
+  return postFromCandidate({
+    id: candidate.id,
+    text: candidate.text ?? fetched.text,
+    username: candidate.username ?? fetched.username,
+  });
+}
+
+function classificationPrompt(post: XPost): string {
+  return [`Author: @${post.username}`, "Post text:", post.text].join("\n");
+}
+
+function normalizeClassifierConfig(value: unknown): ClassifierConfig {
+  if (!isRecord(value)) {
+    return defaultClassifierConfig;
+  }
+
+  const prompt = stringField(value, "prompt");
+  return {
+    enabled: typeof value.enabled === "boolean" ? value.enabled : defaultClassifierConfig.enabled,
+    prompt: prompt === null || prompt.trim() === "" ? null : prompt,
+  };
+}
+
+async function getClassifierConfig(kv: KVNamespace): Promise<ClassifierConfig> {
+  let raw: string | null;
+  try {
+    raw = await kv.get(classifierConfigKey);
+  } catch (error) {
+    console.error("KV classifier config read failed; using default config", {
+      error: errorMessage(error),
+    });
+    return defaultClassifierConfig;
+  }
+
+  if (raw === null) {
+    try {
+      await kv.put(classifierConfigKey, JSON.stringify(defaultClassifierConfig, null, 2));
+    } catch (error) {
+      console.error("KV classifier config creation failed; using default config", {
+        error: errorMessage(error),
+      });
+    }
+    return defaultClassifierConfig;
+  }
+
+  try {
+    return normalizeClassifierConfig(JSON.parse(raw));
+  } catch (error) {
+    console.error("KV classifier config is invalid JSON; using default config", {
+      error: errorMessage(error),
+    });
+    return defaultClassifierConfig;
+  }
 }
 
 async function shouldForwardToSlack(
-  event: XEvent,
-  username: string,
+  post: XPost,
   googleApiKey: string,
+  classifierPrompt: string,
 ): Promise<boolean> {
   const google = createGoogleGenerativeAI({ apiKey: googleApiKey });
   const { output } = await generateText({
@@ -135,9 +394,9 @@ async function shouldForwardToSlack(
       description: "Whether an X post should be forwarded into the Slack channel.",
       options: ["send", "skip"] as const,
     }),
-    system: classificationSystem,
+    system: classifierPrompt,
     temperature: 0,
-    prompt: classificationPrompt(event, username),
+    prompt: classificationPrompt(post),
   });
 
   return output === "send";
@@ -168,44 +427,61 @@ async function putDedupe(dedupeKv: KVNamespace, postId: string): Promise<void> {
   }
 }
 
-async function forwardToSlack(
-  event: XEvent,
-  username: string,
-  webhookUrl: string,
-  googleApiKey: string,
-  dedupeKv: KVNamespace,
-): Promise<void> {
-  if (await isDuplicate(dedupeKv, event.data.id)) {
+async function forwardToSlack(candidate: PostCandidate, env: Env): Promise<void> {
+  if (await isDuplicate(env.DEDUPE_KV, candidate.id)) {
     return;
   }
 
-  let shouldForward = true;
+  let post: XPost | null;
   try {
-    shouldForward = await shouldForwardToSlack(event, username, googleApiKey);
+    post = await resolvePost(candidate, env.X_BEARER_TOKEN);
   } catch (error) {
-    console.error("AI classification failed; forwarding post", {
-      postId: event.data.id,
-      username,
+    console.error("X post lookup failed; skipping incomplete event", {
+      postId: candidate.id,
       error: errorMessage(error),
     });
-  }
-
-  if (!shouldForward) {
-    await putDedupe(dedupeKv, event.data.id);
     return;
   }
 
-  const response = await fetch(webhookUrl, {
+  if (post === null) {
+    console.error("X event did not include enough post data", {
+      postId: candidate.id,
+    });
+    return;
+  }
+
+  const config = await getClassifierConfig(env.DEDUPE_KV);
+  if (config.enabled) {
+    try {
+      const shouldForward = await shouldForwardToSlack(
+        post,
+        env.GOOGLE_GENERATIVE_AI_API_KEY,
+        config.prompt ?? defaultClassifierPrompt,
+      );
+      if (!shouldForward) {
+        await putDedupe(env.DEDUPE_KV, post.id);
+        return;
+      }
+    } catch (error) {
+      console.error("AI classification failed; forwarding post", {
+        postId: post.id,
+        username: post.username,
+        error: errorMessage(error),
+      });
+    }
+  }
+
+  const response = await fetch(env.SLACK_WEBHOOK_URL, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text: slackMessage(event, username) }),
+    body: JSON.stringify({ text: slackMessage(post) }),
   });
 
   if (!response.ok) {
     throw new Error(`Slack webhook returned ${response.status}`);
   }
 
-  await putDedupe(dedupeKv, event.data.id);
+  await putDedupe(env.DEDUPE_KV, post.id);
 }
 
 export default {
@@ -217,9 +493,12 @@ export default {
 
     if (request.method === "GET") {
       const token = url.searchParams.get("crc_token");
-      return token === null
-        ? new Response("Missing crc_token", { status: 400 })
-        : crcResponse(token, env.X_CONSUMER_SECRET);
+      if (token === null) {
+        return new Response("Missing crc_token", { status: 400 });
+      }
+
+      ctx.waitUntil(getClassifierConfig(env.DEDUPE_KV));
+      return crcResponse(token, env.X_CONSUMER_SECRET);
     }
 
     if (request.method !== "POST") {
@@ -242,26 +521,14 @@ export default {
 
     let event: unknown;
     try {
-      event = JSON.parse(new TextDecoder().decode(body));
+      event = JSON.parse(decoder.decode(body));
     } catch {
       return new Response("Invalid JSON", { status: 400 });
     }
 
-    if (!isXEvent(event)) {
-      return new Response("Invalid event", { status: 400 });
-    }
-
-    const user = event.includes.users.find(({ id }) => id === event.data.author_id);
-    if (user !== undefined) {
-      ctx.waitUntil(
-        forwardToSlack(
-          event,
-          user.username,
-          env.SLACK_WEBHOOK_URL,
-          env.GOOGLE_GENERATIVE_AI_API_KEY,
-          env.DEDUPE_KV,
-        ),
-      );
+    const candidates = candidatesFromWebhookEvent(event);
+    for (const next of candidates) {
+      ctx.waitUntil(forwardToSlack(next, env));
     }
 
     return new Response("OK");
