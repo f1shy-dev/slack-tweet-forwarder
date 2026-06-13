@@ -1,4 +1,14 @@
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
+import { generateText, Output } from "ai";
+
 const encoder = new TextEncoder();
+const modelId = "gemini-3.1-flash-lite";
+const classificationSystem = [
+  "Decide whether this X post should be forwarded into the Slack channel.",
+  "Choose send for substantive, high-signal posts: product/company updates, launches, incidents, security items, technical analysis, research, release notes, hiring/funding/business news, or other posts likely useful to the team.",
+  "Choose skip for low-signal posts: memes, jokes, personal chatter, engagement bait, giveaways, repost prompts, vague replies without context, spam, or anything that does not stand alone.",
+  "When uncertain, choose skip.",
+].join("\n");
 
 type XEvent = {
   data: {
@@ -99,10 +109,49 @@ function slackMessage(event: XEvent, username: string): string {
   return `*@${escapeMrkdwn(username)}* posted\n>${text}\n${link}`;
 }
 
+function classificationPrompt(event: XEvent, username: string): string {
+  return [`Author: @${username}`, "Post text:", event.data.text].join("\n");
+}
+
+async function shouldForwardToSlack(
+  event: XEvent,
+  username: string,
+  googleApiKey: string,
+): Promise<boolean> {
+  const google = createGoogleGenerativeAI({ apiKey: googleApiKey });
+  const { output } = await generateText({
+    model: google(modelId),
+    output: Output.choice({
+      name: "SlackForwardDecision",
+      description: "Whether an X post should be forwarded into the Slack channel.",
+      options: ["send", "skip"] as const,
+    }),
+    system: classificationSystem,
+    temperature: 0,
+    prompt: classificationPrompt(event, username),
+  });
+
+  return output === "send";
+}
+
+async function putDedupe(cacheKey: Request): Promise<void> {
+  try {
+    await caches.default.put(
+      cacheKey,
+      new Response(null, {
+        headers: { "cache-control": "max-age=86400" },
+      }),
+    );
+  } catch {
+    // Cache API deduplication is best-effort.
+  }
+}
+
 async function forwardToSlack(
   event: XEvent,
   username: string,
   webhookUrl: string,
+  googleApiKey: string,
   requestUrl: string,
 ): Promise<void> {
   const cacheKey = new Request(
@@ -117,6 +166,11 @@ async function forwardToSlack(
     // Cache API deduplication is best-effort.
   }
 
+  if (!(await shouldForwardToSlack(event, username, googleApiKey))) {
+    await putDedupe(cacheKey);
+    return;
+  }
+
   const response = await fetch(webhookUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -127,16 +181,7 @@ async function forwardToSlack(
     throw new Error(`Slack webhook returned ${response.status}`);
   }
 
-  try {
-    await caches.default.put(
-      cacheKey,
-      new Response(null, {
-        headers: { "cache-control": "max-age=86400" },
-      }),
-    );
-  } catch {
-    // Cache API deduplication is best-effort.
-  }
+  await putDedupe(cacheKey);
 }
 
 export default {
@@ -184,7 +229,15 @@ export default {
 
     const user = event.includes.users.find(({ id }) => id === event.data.author_id);
     if (user !== undefined) {
-      ctx.waitUntil(forwardToSlack(event, user.username, env.SLACK_WEBHOOK_URL, request.url));
+      ctx.waitUntil(
+        forwardToSlack(
+          event,
+          user.username,
+          env.SLACK_WEBHOOK_URL,
+          env.GOOGLE_GENERATIVE_AI_API_KEY,
+          request.url,
+        ),
+      );
     }
 
     return new Response("OK");

@@ -4,6 +4,6 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-06-12",
   "secrets": {
-    "required": ["X_CONSUMER_SECRET", "SLACK_WEBHOOK_URL"],
+    "required": ["X_CONSUMER_SECRET", "SLACK_WEBHOOK_URL", "GOOGLE_GENERATIVE_AI_API_KEY"],
   },
 }
