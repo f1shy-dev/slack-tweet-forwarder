@@ -173,7 +173,7 @@ function candidatesFromAccountActivity(value: unknown): Array<PostCandidate> {
 }
 
 function candidatesFromActivityPayload(payload: unknown, depth = 0): Array<PostCandidate> {
-  if (depth >= 3) {
+  if (depth > 3) {
     return [];
   }
 
@@ -188,7 +188,7 @@ function candidatesFromActivityPayload(payload: unknown, depth = 0): Array<PostC
     candidateFromTweetObject(payload),
   ];
 
-  if (!isRecord(payload)) {
+  if (!isRecord(payload) || depth >= 3) {
     return mergeCandidates(candidates);
   }
 
@@ -204,6 +204,29 @@ function candidatesFromActivityPayload(payload: unknown, depth = 0): Array<PostC
   }
 
   return mergeCandidates(candidates);
+}
+
+function candidateFromActivityData(data: Record<string, unknown>): PostCandidate | null {
+  const payload = recordField(data, "payload");
+  if (payload === null) {
+    return null;
+  }
+
+  const post = candidateFromTweetObject(payload);
+  const authorId = idField(payload, "author_id");
+  const includes = recordField(data, "includes");
+  const users = includes === null ? [] : arrayField(includes, "users");
+  const user = users.find(
+    (item) => isRecord(item) && authorId !== null && idField(item, "id") === authorId,
+  );
+
+  return post === null
+    ? null
+    : {
+        id: post.id,
+        text: post.text,
+        username: post.username ?? usernameFromUser(user),
+      };
 }
 
 function isPostCreateEventType(value: string | null): boolean {
@@ -225,7 +248,10 @@ function candidatesFromActivityEvent(value: unknown): Array<PostCandidate> {
     return [];
   }
 
-  return candidatesFromActivityPayload(data.payload ?? data);
+  return mergeCandidates([
+    candidateFromActivityData(data),
+    ...candidatesFromActivityPayload(data.payload ?? data),
+  ]);
 }
 
 function candidatesFromWebhookEvent(value: unknown): Array<PostCandidate> {
