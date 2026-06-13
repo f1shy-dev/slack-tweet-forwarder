@@ -122,14 +122,14 @@ test("extracts the captured X Activity post.create stream payload", () => {
   ]);
 });
 
-test("escapes Slack mrkdwn and blockquotes multiline post text", () => {
+test("formats Slack messages as a bare X status URL for unfurling", () => {
   assert.equal(
     slackMessage({
       id: "123",
       username: "fish&chips",
       text: "one & <two>\nthree",
     }),
-    "*@fish&amp;chips* posted\n>one &amp; &lt;two&gt;\n>three\nhttps://x.com/fish%26chips/status/123",
+    "https://x.com/fish%26chips/status/123",
   );
 });
 
@@ -181,7 +181,9 @@ test("forwards a captured stream post when classification is disabled and suppre
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.url, env.slackWebhookUrl);
     assert.deepEqual(JSON.parse(calls[0]?.body ?? ""), {
-      text: "*@vishyfishy2* posted\n>meow\nhttps://x.com/vishyfishy2/status/2065839641417138368",
+      text: "https://x.com/vishyfishy2/status/2065839641417138368",
+      unfurl_links: true,
+      unfurl_media: true,
     });
     const dedupeFile: unknown = JSON.parse(await readFile(env.dedupePath, "utf8"));
     assert.equal(typeof dedupeFile, "object");
@@ -308,7 +310,9 @@ test("looks up incomplete stream events before forwarding", async () => {
     assert.match(calls[0]?.url ?? "", /^https:\/\/api\.x\.com\/2\/tweets\/42\?/);
     assert.equal(calls[1]?.url, env.slackWebhookUrl);
     assert.deepEqual(JSON.parse(calls[1]?.body ?? ""), {
-      text: "*@lookup_user* posted\n>lookup text\nhttps://x.com/lookup_user/status/42",
+      text: "https://x.com/lookup_user/status/42",
+      unfurl_links: true,
+      unfurl_media: true,
     });
   });
 });

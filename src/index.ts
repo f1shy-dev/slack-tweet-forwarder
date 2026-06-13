@@ -443,14 +443,9 @@ export class DedupeStore {
   }
 }
 
-function escapeMrkdwn(value: string): string {
-  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
-
 export function slackMessage(post: XPost): string {
-  const text = escapeMrkdwn(post.text).replaceAll("\n", "\n>");
   const link = `https://x.com/${encodeURIComponent(post.username)}/status/${encodeURIComponent(post.id)}`;
-  return `*@${escapeMrkdwn(post.username)}* posted\n>${text}\n${link}`;
+  return link;
 }
 
 function classificationPrompt(post: XPost): string {
@@ -482,7 +477,11 @@ async function postToSlack(post: XPost, webhookUrl: string): Promise<void> {
   const response = await fetch(webhookUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text: slackMessage(post) }),
+    body: JSON.stringify({
+      text: slackMessage(post),
+      unfurl_links: true,
+      unfurl_media: true,
+    }),
   });
 
   if (!response.ok) {
