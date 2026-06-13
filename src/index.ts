@@ -3,6 +3,7 @@ import { generateText, Output } from "ai";
 
 const encoder = new TextEncoder();
 const modelId = "gemini-3.1-flash-lite";
+const dedupeTtlSeconds = 60 * 60 * 24;
 const classificationSystem = [
   "Decide whether this X post should be forwarded into the Slack channel.",
   "Choose send for substantive, high-signal posts: product/company updates, launches, incidents, security items, technical analysis, research, release notes, hiring/funding/business news, or other posts likely useful to the team.",
@@ -109,6 +110,14 @@ function slackMessage(event: XEvent, username: string): string {
   return `*@${escapeMrkdwn(username)}* posted\n>${text}\n${link}`;
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function dedupeKey(postId: string): string {
+  return `post:${postId}`;
+}
+
 function classificationPrompt(event: XEvent, username: string): string {
   return [`Author: @${username}`, "Post text:", event.data.text].join("\n");
 }
@@ -134,16 +143,28 @@ async function shouldForwardToSlack(
   return output === "send";
 }
 
-async function putDedupe(cacheKey: Request): Promise<void> {
+async function isDuplicate(dedupeKv: KVNamespace, postId: string): Promise<boolean> {
   try {
-    await caches.default.put(
-      cacheKey,
-      new Response(null, {
-        headers: { "cache-control": "max-age=86400" },
-      }),
-    );
-  } catch {
-    // Cache API deduplication is best-effort.
+    return (await dedupeKv.get(dedupeKey(postId))) !== null;
+  } catch (error) {
+    console.error("KV dedupe read failed; treating post as new", {
+      postId,
+      error: errorMessage(error),
+    });
+    return false;
+  }
+}
+
+async function putDedupe(dedupeKv: KVNamespace, postId: string): Promise<void> {
+  try {
+    await dedupeKv.put(dedupeKey(postId), "1", {
+      expirationTtl: dedupeTtlSeconds,
+    });
+  } catch (error) {
+    console.error("KV dedupe write failed", {
+      postId,
+      error: errorMessage(error),
+    });
   }
 }
 
@@ -152,22 +173,25 @@ async function forwardToSlack(
   username: string,
   webhookUrl: string,
   googleApiKey: string,
-  requestUrl: string,
+  dedupeKv: KVNamespace,
 ): Promise<void> {
-  const cacheKey = new Request(
-    new URL(`/webhook/dedupe/${encodeURIComponent(event.data.id)}`, requestUrl),
-  );
-
-  try {
-    if (await caches.default.match(cacheKey)) {
-      return;
-    }
-  } catch {
-    // Cache API deduplication is best-effort.
+  if (await isDuplicate(dedupeKv, event.data.id)) {
+    return;
   }
 
-  if (!(await shouldForwardToSlack(event, username, googleApiKey))) {
-    await putDedupe(cacheKey);
+  let shouldForward = true;
+  try {
+    shouldForward = await shouldForwardToSlack(event, username, googleApiKey);
+  } catch (error) {
+    console.error("AI classification failed; forwarding post", {
+      postId: event.data.id,
+      username,
+      error: errorMessage(error),
+    });
+  }
+
+  if (!shouldForward) {
+    await putDedupe(dedupeKv, event.data.id);
     return;
   }
 
@@ -181,7 +205,7 @@ async function forwardToSlack(
     throw new Error(`Slack webhook returned ${response.status}`);
   }
 
-  await putDedupe(cacheKey);
+  await putDedupe(dedupeKv, event.data.id);
 }
 
 export default {
@@ -235,7 +259,7 @@ export default {
           user.username,
           env.SLACK_WEBHOOK_URL,
           env.GOOGLE_GENERATIVE_AI_API_KEY,
-          request.url,
+          env.DEDUPE_KV,
         ),
       );
     }
