@@ -173,6 +173,10 @@ function candidatesFromAccountActivity(value: unknown): Array<PostCandidate> {
 }
 
 function candidatesFromActivityPayload(payload: unknown, depth = 0): Array<PostCandidate> {
+  if (depth >= 3) {
+    return [];
+  }
+
   if (Array.isArray(payload)) {
     return mergeCandidates(
       payload.flatMap((item) => candidatesFromActivityPayload(item, depth + 1)),
@@ -184,7 +188,7 @@ function candidatesFromActivityPayload(payload: unknown, depth = 0): Array<PostC
     candidateFromTweetObject(payload),
   ];
 
-  if (!isRecord(payload) || depth >= 3) {
+  if (!isRecord(payload)) {
     return mergeCandidates(candidates);
   }
 
