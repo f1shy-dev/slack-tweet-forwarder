@@ -8,6 +8,7 @@ import {
   DedupeStore,
   getClassifierConfig,
   processActivityEvent,
+  run,
   slackMessage,
   streamLines,
   type Env,
@@ -91,6 +92,26 @@ async function loadDedupe(path: string): Promise<DedupeStore> {
   return dedupe;
 }
 
+async function withEnv<T>(values: Record<string, string>, callback: () => Promise<T>): Promise<T> {
+  const original = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(values)) {
+    original.set(key, process.env[key]);
+    process.env[key] = value;
+  }
+
+  try {
+    return await callback();
+  } finally {
+    for (const [key, value] of original) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
 test("extracts the captured X Activity post.create stream payload", () => {
   assert.deepEqual(candidatesFromActivityEvent(sampleEvent), [
     {
@@ -120,6 +141,19 @@ test("creates default classifier config when missing", async () => {
       enabled: true,
       prompt: null,
     });
+  });
+});
+
+test("resets invalid dedupe JSON instead of failing startup", async () => {
+  await withTempDir(async (path) => {
+    const dedupePath = join(path, "dedupe.json");
+    await writeFile(dedupePath, "{not json");
+    const dedupe = new DedupeStore(dedupePath);
+
+    await dedupe.load();
+
+    assert.equal(await dedupe.isDuplicate("123"), false);
+    assert.deepEqual(JSON.parse(await readFile(dedupePath, "utf8")), {});
   });
 });
 
@@ -159,6 +193,20 @@ test("forwards a captured stream post when classification is disabled and suppre
   });
 });
 
+test("does not reject the stream loop when one Slack post fails", async () => {
+  await withTempDir(async (path) => {
+    const env = await createEnv(path, { enabled: false, prompt: null });
+    const dedupe = await loadDedupe(path);
+
+    await withMockFetch(
+      async () => new Response("Slack exploded", { status: 500 }),
+      async () => {
+        await processActivityEvent(sampleEvent, env, dedupe);
+      },
+    );
+  });
+});
+
 test("does not forward unclassified posts when classification is enabled without a Google key", async () => {
   await withTempDir(async (path) => {
     const env = await createEnv(path, { enabled: true, prompt: null });
@@ -180,6 +228,37 @@ test("does not forward unclassified posts when classification is enabled without
     );
 
     assert.deepEqual(calls, []);
+  });
+});
+
+test("shuts down cleanly while waiting to reconnect", async () => {
+  await withTempDir(async (path) => {
+    await withEnv(
+      {
+        X_BEARER_TOKEN: "invalid",
+        SLACK_WEBHOOK_URL: "https://hooks.slack.test/services/example",
+        CONFIG_PATH: join(path, "classifier-config.json"),
+        DEDUPE_PATH: join(path, "dedupe.json"),
+      },
+      async () => {
+        await writeFile(join(path, "classifier-config.json"), '{"enabled":false,"prompt":null}\n');
+        const controller = new AbortController();
+        const promise = withMockFetch(
+          async () =>
+            Response.json(
+              {
+                title: "Unauthorized",
+                status: 401,
+              },
+              { status: 401 },
+            ),
+          async () => run(controller.signal),
+        );
+
+        setTimeout(() => controller.abort(), 10);
+        await promise;
+      },
+    );
   });
 });
 

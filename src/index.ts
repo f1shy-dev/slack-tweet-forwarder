@@ -377,9 +377,24 @@ export class DedupeStore {
       throw error;
     }
 
-    const parsed: unknown = JSON.parse(raw);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      console.error("Dedupe file is invalid JSON; resetting", {
+        path: this.#path,
+        error: errorMessage(error),
+      });
+      this.#entries.clear();
+      await this.#save();
+      return;
+    }
+
     if (!isRecord(parsed)) {
-      throw new Error("Dedupe file must contain a JSON object");
+      console.error("Dedupe file must contain a JSON object; resetting", { path: this.#path });
+      this.#entries.clear();
+      await this.#save();
+      return;
     }
 
     this.#entries.clear();
@@ -621,7 +636,14 @@ export async function processActivityEvent(
   }
 
   for (const next of candidates) {
-    await processCandidate(next, env, dedupe);
+    try {
+      await processCandidate(next, env, dedupe);
+    } catch (error) {
+      console.error("X post candidate processing failed", {
+        candidate: candidateSummary(next),
+        error: errorMessage(error),
+      });
+    }
   }
 }
 
@@ -737,7 +759,15 @@ export async function run(signal: AbortSignal): Promise<void> {
         error: errorMessage(error),
         retryInMs: backoffMs,
       });
-      await sleep(backoffMs, signal);
+      try {
+        await sleep(backoffMs, signal);
+      } catch (sleepError) {
+        if (signal.aborted) {
+          return;
+        }
+
+        throw sleepError;
+      }
       backoffMs = Math.min(backoffMs * 2, 60_000);
     }
   }
