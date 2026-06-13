@@ -3,7 +3,13 @@
   "name": "slack-tweet-forwarder",
   "main": "src/index.ts",
   "compatibility_date": "2026-06-12",
+  "kv_namespaces": [
+    {
+      "binding": "DEDUPE_KV",
+      "id": "REPLACE_WITH_KV_NAMESPACE_ID",
+    },
+  ],
   "secrets": {
-    "required": ["X_CONSUMER_SECRET", "SLACK_WEBHOOK_URL"],
+    "required": ["X_CONSUMER_SECRET", "SLACK_WEBHOOK_URL", "GOOGLE_GENERATIVE_AI_API_KEY"],
   },
 }
