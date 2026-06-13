@@ -262,17 +262,44 @@ function candidatesFromWebhookEvent(value: unknown): Array<PostCandidate> {
   ]);
 }
 
+function candidateSummary(candidate: PostCandidate): Record<string, unknown> {
+  return {
+    postId: candidate.id,
+    username: candidate.username,
+    hasText: candidate.text !== null,
+    textLength: candidate.text?.length ?? 0,
+    needsLookup: candidate.text === null || candidate.username === null,
+  };
+}
+
+function postSummary(post: XPost): Record<string, unknown> {
+  return {
+    postId: post.id,
+    username: post.username,
+    textLength: post.text.length,
+  };
+}
+
 function describeEvent(value: unknown): Record<string, unknown> {
   if (!isRecord(value)) {
     return { type: typeof value };
   }
 
   const data = recordField(value, "data");
+  const payload = data === null ? recordField(value, "payload") : recordField(data, "payload");
+  const includes = data === null ? recordField(value, "includes") : recordField(data, "includes");
   return {
     keys: Object.keys(value).slice(0, 12),
     dataKeys: data === null ? [] : Object.keys(data).slice(0, 12),
+    payloadKeys: payload === null ? [] : Object.keys(payload).slice(0, 12),
     eventType:
       stringField(value, "event_type") ?? (data === null ? null : stringField(data, "event_type")),
+    eventUuid: data === null ? null : stringField(data, "event_uuid"),
+    tag: data === null ? stringField(value, "tag") : stringField(data, "tag"),
+    payloadId: payload === null ? null : idField(payload, "id"),
+    payloadAuthorId: payload === null ? null : idField(payload, "author_id"),
+    includesUsers: includes === null ? 0 : arrayField(includes, "users").length,
+    includesTweets: includes === null ? 0 : arrayField(includes, "tweets").length,
     hasTweetCreateEvents: Array.isArray(value.tweet_create_events),
     hasMatchingRules: Array.isArray(value.matching_rules),
   };
@@ -485,7 +512,12 @@ async function putDedupe(dedupeKv: KVNamespace, postId: string): Promise<void> {
 }
 
 async function forwardToSlack(candidate: PostCandidate, env: Env): Promise<void> {
+  console.info("Processing X post candidate", candidateSummary(candidate));
+
   if (await isDuplicate(env.DEDUPE_KV, candidate.id)) {
+    console.info("Skipping duplicate X post", {
+      postId: candidate.id,
+    });
     return;
   }
 
@@ -503,11 +535,20 @@ async function forwardToSlack(candidate: PostCandidate, env: Env): Promise<void>
   if (post === null) {
     console.error("X event did not include enough post data", {
       postId: candidate.id,
+      candidate: candidateSummary(candidate),
     });
     return;
   }
 
+  console.info("Resolved X post", postSummary(post));
+
   const config = await getClassifierConfig(env.DEDUPE_KV);
+  console.info("Loaded classifier config", {
+    postId: post.id,
+    enabled: config.enabled,
+    hasCustomPrompt: config.prompt !== null,
+  });
+
   if (config.enabled) {
     try {
       const shouldForward = await shouldForwardToSlack(
@@ -516,9 +557,12 @@ async function forwardToSlack(candidate: PostCandidate, env: Env): Promise<void>
         config.prompt ?? defaultClassifierPrompt,
       );
       if (!shouldForward) {
+        console.info("AI classifier skipped X post", postSummary(post));
         await putDedupe(env.DEDUPE_KV, post.id);
         return;
       }
+
+      console.info("AI classifier approved X post", postSummary(post));
     } catch (error) {
       console.error("AI classification failed; forwarding post", {
         postId: post.id,
@@ -526,8 +570,11 @@ async function forwardToSlack(candidate: PostCandidate, env: Env): Promise<void>
         error: errorMessage(error),
       });
     }
+  } else {
+    console.info("AI classification disabled; forwarding X post", postSummary(post));
   }
 
+  console.info("Posting X post to Slack", postSummary(post));
   const response = await fetch(env.SLACK_WEBHOOK_URL, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -535,9 +582,17 @@ async function forwardToSlack(candidate: PostCandidate, env: Env): Promise<void>
   });
 
   if (!response.ok) {
+    console.error("Slack webhook rejected X post", {
+      ...postSummary(post),
+      status: response.status,
+    });
     throw new Error(`Slack webhook returned ${response.status}`);
   }
 
+  console.info("Slack webhook accepted X post", {
+    ...postSummary(post),
+    status: response.status,
+  });
   await putDedupe(env.DEDUPE_KV, post.id);
 }
 
@@ -584,6 +639,13 @@ export default {
     }
 
     const candidates = candidatesFromWebhookEvent(event);
+    console.info("Signed X webhook event accepted", {
+      bodyBytes: body.byteLength,
+      event: describeEvent(event),
+      candidateCount: candidates.length,
+      candidates: candidates.map(candidateSummary),
+    });
+
     if (candidates.length === 0) {
       console.warn("Signed X webhook event did not contain a supported post payload", {
         event: describeEvent(event),
@@ -591,7 +653,14 @@ export default {
     }
 
     for (const next of candidates) {
-      ctx.waitUntil(forwardToSlack(next, env));
+      ctx.waitUntil(
+        forwardToSlack(next, env).catch((error: unknown) => {
+          console.error("Failed to process X post candidate", {
+            candidate: candidateSummary(next),
+            error: errorMessage(error),
+          });
+        }),
+      );
     }
 
     return new Response("OK");
