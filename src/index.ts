@@ -1,11 +1,14 @@
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { generateText, Output } from "ai";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
+import { pathToFileURL } from "node:url";
 
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
 const modelId = "gemini-3.1-flash-lite";
-const dedupeTtlSeconds = 60 * 60 * 24;
-const classifierConfigKey = "config:classifier";
+const dedupeTtlMs = 60 * 60 * 24 * 1000;
+const activityStreamUrl = "https://api.x.com/2/activity/stream";
+const defaultConfigPath = "data/classifier-config.json";
+const defaultDedupePath = "data/dedupe.json";
 const defaultClassifierPrompt = [
   "Decide whether this X post should be forwarded into the Slack channel.",
   "Choose send for substantive, high-signal posts: product/company updates, launches, incidents, security items, technical analysis, research, release notes, hiring/funding/business news, or other posts likely useful to the team.",
@@ -13,19 +16,27 @@ const defaultClassifierPrompt = [
   "When uncertain, choose skip.",
 ].join("\n");
 
-type PostCandidate = {
+export type Env = {
+  xBearerToken: string;
+  slackWebhookUrl: string;
+  googleApiKey: string | null;
+  configPath: string;
+  dedupePath: string;
+};
+
+export type PostCandidate = {
   id: string;
   text: string | null;
   username: string | null;
 };
 
-type XPost = {
+export type XPost = {
   id: string;
   text: string;
   username: string;
 };
 
-type ClassifierConfig = {
+export type ClassifierConfig = {
   enabled: boolean;
   prompt: string | null;
 };
@@ -63,6 +74,34 @@ function idField(value: Record<string, unknown>, key: string): string | null {
   return typeof field === "number" && Number.isSafeInteger(field) ? String(field) : null;
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function requiredEnv(name: string): string {
+  const value = process.env[name];
+  if (value === undefined || value.trim() === "") {
+    throw new Error(`${name} is required`);
+  }
+
+  return value;
+}
+
+function optionalEnv(name: string): string | null {
+  const value = process.env[name];
+  return value === undefined || value.trim() === "" ? null : value;
+}
+
+function readEnv(): Env {
+  return {
+    xBearerToken: requiredEnv("X_BEARER_TOKEN"),
+    slackWebhookUrl: requiredEnv("SLACK_WEBHOOK_URL"),
+    googleApiKey: optionalEnv("GOOGLE_GENERATIVE_AI_API_KEY"),
+    configPath: process.env.CONFIG_PATH ?? defaultConfigPath,
+    dedupePath: process.env.DEDUPE_PATH ?? defaultDedupePath,
+  };
+}
+
 function usernameFromUser(value: unknown): string | null {
   if (!isRecord(value)) {
     return null;
@@ -96,32 +135,6 @@ function mergeCandidates(candidates: Array<PostCandidate | null>): Array<PostCan
   }
 
   return [...merged.values()];
-}
-
-function candidateFromFilteredStream(value: unknown): PostCandidate | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-
-  const data = recordField(value, "data");
-  if (data === null) {
-    return null;
-  }
-
-  const id = idField(data, "id");
-  const text = stringField(data, "text");
-  const authorId = idField(data, "author_id");
-  const includes = recordField(value, "includes");
-  const users = includes === null ? [] : arrayField(includes, "users");
-  const user = users.find(
-    (item) => isRecord(item) && authorId !== null && idField(item, "id") === authorId,
-  );
-  const username =
-    usernameFromUser(user) ??
-    usernameFromUser(recordField(data, "user")) ??
-    usernameFromUser(recordField(data, "author"));
-
-  return candidate(id, text, username);
 }
 
 function candidateFromTweetObject(
@@ -159,19 +172,6 @@ function candidateFromTweetObject(
   return candidate(id, text, username);
 }
 
-function candidatesFromAccountActivity(value: unknown): Array<PostCandidate> {
-  if (!isRecord(value)) {
-    return [];
-  }
-
-  const subscribedUserId = idField(value, "for_user_id");
-  return mergeCandidates(
-    arrayField(value, "tweet_create_events").map((event) =>
-      candidateFromTweetObject(event, subscribedUserId),
-    ),
-  );
-}
-
 function candidatesFromActivityPayload(payload: unknown, depth = 0): Array<PostCandidate> {
   if (depth > 3) {
     return [];
@@ -183,10 +183,7 @@ function candidatesFromActivityPayload(payload: unknown, depth = 0): Array<PostC
     );
   }
 
-  const candidates: Array<PostCandidate | null> = [
-    candidateFromFilteredStream(payload),
-    candidateFromTweetObject(payload),
-  ];
+  const candidates: Array<PostCandidate | null> = [candidateFromTweetObject(payload)];
 
   if (!isRecord(payload) || depth >= 3) {
     return mergeCandidates(candidates);
@@ -206,6 +203,17 @@ function candidatesFromActivityPayload(payload: unknown, depth = 0): Array<PostC
   return mergeCandidates(candidates);
 }
 
+function usernameFromIncludes(
+  includes: Record<string, unknown> | null,
+  authorId: string | null,
+): string | null {
+  const users = includes === null ? [] : arrayField(includes, "users");
+  const user = users.find(
+    (item) => isRecord(item) && authorId !== null && idField(item, "id") === authorId,
+  );
+  return usernameFromUser(user);
+}
+
 function candidateFromActivityData(data: Record<string, unknown>): PostCandidate | null {
   const payload = recordField(data, "payload");
   if (payload === null) {
@@ -214,18 +222,13 @@ function candidateFromActivityData(data: Record<string, unknown>): PostCandidate
 
   const post = candidateFromTweetObject(payload);
   const authorId = idField(payload, "author_id");
-  const includes = recordField(data, "includes");
-  const users = includes === null ? [] : arrayField(includes, "users");
-  const user = users.find(
-    (item) => isRecord(item) && authorId !== null && idField(item, "id") === authorId,
-  );
 
   return post === null
     ? null
     : {
         id: post.id,
         text: post.text,
-        username: post.username ?? usernameFromUser(user),
+        username: post.username ?? usernameFromIncludes(recordField(data, "includes"), authorId),
       };
 }
 
@@ -233,7 +236,7 @@ function isPostCreateEventType(value: string | null): boolean {
   return value === "post.create" || value === "PostCreate" || value === "tweet.create";
 }
 
-function candidatesFromActivityEvent(value: unknown): Array<PostCandidate> {
+export function candidatesFromActivityEvent(value: unknown): Array<PostCandidate> {
   if (!isRecord(value)) {
     return [];
   }
@@ -252,32 +255,6 @@ function candidatesFromActivityEvent(value: unknown): Array<PostCandidate> {
     candidateFromActivityData(data),
     ...candidatesFromActivityPayload(data.payload ?? data),
   ]);
-}
-
-function candidatesFromWebhookEvent(value: unknown): Array<PostCandidate> {
-  return mergeCandidates([
-    candidateFromFilteredStream(value),
-    ...candidatesFromAccountActivity(value),
-    ...candidatesFromActivityEvent(value),
-  ]);
-}
-
-function candidateSummary(candidate: PostCandidate): Record<string, unknown> {
-  return {
-    postId: candidate.id,
-    username: candidate.username,
-    hasText: candidate.text !== null,
-    textLength: candidate.text?.length ?? 0,
-    needsLookup: candidate.text === null || candidate.username === null,
-  };
-}
-
-function postSummary(post: XPost): Record<string, unknown> {
-  return {
-    postId: post.id,
-    username: post.username,
-    textLength: post.text.length,
-  };
 }
 
 function describeEvent(value: unknown): Record<string, unknown> {
@@ -300,76 +277,25 @@ function describeEvent(value: unknown): Record<string, unknown> {
     payloadAuthorId: payload === null ? null : idField(payload, "author_id"),
     includesUsers: includes === null ? 0 : arrayField(includes, "users").length,
     includesTweets: includes === null ? 0 : arrayField(includes, "tweets").length,
-    hasTweetCreateEvents: Array.isArray(value.tweet_create_events),
-    hasMatchingRules: Array.isArray(value.matching_rules),
   };
 }
 
-async function importHmacKey(secret: string): Promise<CryptoKey> {
-  return crypto.subtle.importKey(
-    "raw",
-    encoder.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign", "verify"],
-  );
+function candidateSummary(candidate: PostCandidate): Record<string, unknown> {
+  return {
+    postId: candidate.id,
+    username: candidate.username,
+    hasText: candidate.text !== null,
+    textLength: candidate.text?.length ?? 0,
+    needsLookup: candidate.text === null || candidate.username === null,
+  };
 }
 
-function encodeBase64(value: ArrayBuffer): string {
-  return btoa(String.fromCharCode(...new Uint8Array(value)));
-}
-
-function decodeSignature(value: string | null): Uint8Array | null {
-  if (!value?.startsWith("sha256=")) {
-    return null;
-  }
-
-  try {
-    return Uint8Array.from(atob(value.slice(7)), (character) => character.charCodeAt(0));
-  } catch {
-    return null;
-  }
-}
-
-async function crcResponse(token: string, secret: string): Promise<Response> {
-  const key = await importHmacKey(secret);
-  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(token));
-
-  return Response.json({
-    response_token: `sha256=${encodeBase64(signature)}`,
-  });
-}
-
-async function hasValidSignature(
-  body: ArrayBuffer,
-  signatureHeader: string | null,
-  secret: string,
-): Promise<boolean> {
-  const signature = decodeSignature(signatureHeader);
-  if (signature === null) {
-    return false;
-  }
-
-  const key = await importHmacKey(secret);
-  return crypto.subtle.verify("HMAC", key, signature, body);
-}
-
-function escapeMrkdwn(value: string): string {
-  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
-
-function slackMessage(post: XPost): string {
-  const text = escapeMrkdwn(post.text).replaceAll("\n", "\n>");
-  const link = `https://x.com/${encodeURIComponent(post.username)}/status/${encodeURIComponent(post.id)}`;
-  return `*@${escapeMrkdwn(post.username)}* posted\n>${text}\n${link}`;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function dedupeKey(postId: string): string {
-  return `post:${postId}`;
+function postSummary(post: XPost): Record<string, unknown> {
+  return {
+    postId: post.id,
+    username: post.username,
+    textLength: post.text.length,
+  };
 }
 
 function postFromCandidate(candidate: PostCandidate): XPost | null {
@@ -382,43 +308,11 @@ function postFromCandidate(candidate: PostCandidate): XPost | null {
       };
 }
 
-async function fetchPost(postId: string, bearerToken: string): Promise<PostCandidate | null> {
-  const url = new URL(`https://api.x.com/2/tweets/${encodeURIComponent(postId)}`);
-  url.searchParams.set("expansions", "author_id");
-  url.searchParams.set("tweet.fields", "author_id,created_at");
-  url.searchParams.set("user.fields", "id,name,username");
-
-  const response = await fetch(url, {
-    headers: { authorization: `Bearer ${bearerToken}` },
-  });
-  if (!response.ok) {
-    throw new Error(`X post lookup returned ${response.status}`);
-  }
-
-  const body: unknown = await response.json();
-  return candidatesFromActivityPayload(body)[0] ?? null;
-}
-
-async function resolvePost(candidate: PostCandidate, bearerToken: string): Promise<XPost | null> {
-  const complete = postFromCandidate(candidate);
-  if (complete !== null) {
-    return complete;
-  }
-
-  const fetched = await fetchPost(candidate.id, bearerToken);
-  if (fetched === null) {
-    return null;
-  }
-
-  return postFromCandidate({
-    id: candidate.id,
-    text: candidate.text ?? fetched.text,
-    username: candidate.username ?? fetched.username,
-  });
-}
-
-function classificationPrompt(post: XPost): string {
-  return [`Author: @${post.username}`, "Post text:", post.text].join("\n");
+async function atomicWrite(path: string, value: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const tempPath = `${path}.${process.pid}.tmp`;
+  await writeFile(tempPath, value);
+  await rename(tempPath, path);
 }
 
 function normalizeClassifierConfig(value: unknown): ClassifierConfig {
@@ -433,36 +327,119 @@ function normalizeClassifierConfig(value: unknown): ClassifierConfig {
   };
 }
 
-async function getClassifierConfig(kv: KVNamespace): Promise<ClassifierConfig> {
-  let raw: string | null;
+export async function getClassifierConfig(path: string): Promise<ClassifierConfig> {
+  let raw: string;
   try {
-    raw = await kv.get(classifierConfigKey);
+    raw = await readFile(path, "utf8");
   } catch (error) {
-    console.error("KV classifier config read failed; using default config", {
+    if (isRecord(error) && error.code === "ENOENT") {
+      await atomicWrite(path, `${JSON.stringify(defaultClassifierConfig, null, 2)}\n`);
+      console.info("Created default classifier config", { path });
+      return defaultClassifierConfig;
+    }
+
+    console.error("Classifier config read failed; using default config", {
+      path,
       error: errorMessage(error),
     });
-    return defaultClassifierConfig;
-  }
-
-  if (raw === null) {
-    try {
-      await kv.put(classifierConfigKey, JSON.stringify(defaultClassifierConfig, null, 2));
-    } catch (error) {
-      console.error("KV classifier config creation failed; using default config", {
-        error: errorMessage(error),
-      });
-    }
     return defaultClassifierConfig;
   }
 
   try {
     return normalizeClassifierConfig(JSON.parse(raw));
   } catch (error) {
-    console.error("KV classifier config is invalid JSON; using default config", {
+    console.error("Classifier config is invalid JSON; using default config", {
+      path,
       error: errorMessage(error),
     });
     return defaultClassifierConfig;
   }
+}
+
+export class DedupeStore {
+  readonly #path: string;
+  readonly #entries = new Map<string, number>();
+
+  constructor(path: string) {
+    this.#path = path;
+  }
+
+  async load(): Promise<void> {
+    let raw: string;
+    try {
+      raw = await readFile(this.#path, "utf8");
+    } catch (error) {
+      if (isRecord(error) && error.code === "ENOENT") {
+        await this.#save();
+        return;
+      }
+
+      throw error;
+    }
+
+    const parsed: unknown = JSON.parse(raw);
+    if (!isRecord(parsed)) {
+      throw new Error("Dedupe file must contain a JSON object");
+    }
+
+    this.#entries.clear();
+    for (const [key, expiresAt] of Object.entries(parsed)) {
+      if (typeof expiresAt === "number" && Number.isFinite(expiresAt)) {
+        this.#entries.set(key, expiresAt);
+      }
+    }
+    await this.#prune();
+  }
+
+  async isDuplicate(postId: string): Promise<boolean> {
+    await this.#prune();
+    return this.#entries.has(this.#key(postId));
+  }
+
+  async put(postId: string): Promise<void> {
+    this.#entries.set(this.#key(postId), Date.now() + dedupeTtlMs);
+    await this.#save();
+  }
+
+  async #prune(): Promise<void> {
+    const now = Date.now();
+    let changed = false;
+    for (const [key, expiresAt] of this.#entries) {
+      if (expiresAt <= now) {
+        this.#entries.delete(key);
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      await this.#save();
+    }
+  }
+
+  async #save(): Promise<void> {
+    await atomicWrite(
+      this.#path,
+      `${JSON.stringify(Object.fromEntries(this.#entries), null, 2)}\n`,
+    );
+  }
+
+  #key(postId: string): string {
+    return `post:${postId}`;
+  }
+}
+
+function escapeMrkdwn(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+export function slackMessage(post: XPost): string {
+  const text = escapeMrkdwn(post.text).replaceAll("\n", "\n>");
+  const link = `https://x.com/${encodeURIComponent(post.username)}/status/${encodeURIComponent(post.id)}`;
+  return `*@${escapeMrkdwn(post.username)}* posted\n>${text}\n${link}`;
+}
+
+function classificationPrompt(post: XPost): string {
+  return [`Author: @${post.username}`, "Post text:", post.text].join("\n");
 }
 
 async function shouldForwardToSlack(
@@ -486,63 +463,97 @@ async function shouldForwardToSlack(
   return output === "send";
 }
 
-async function isDuplicate(dedupeKv: KVNamespace, postId: string): Promise<boolean> {
-  try {
-    return (await dedupeKv.get(dedupeKey(postId))) !== null;
-  } catch (error) {
-    console.error("KV dedupe read failed; treating post as new", {
-      postId,
-      error: errorMessage(error),
-    });
-    return false;
+async function postToSlack(post: XPost, webhookUrl: string): Promise<void> {
+  const response = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: slackMessage(post) }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Slack webhook returned ${response.status}`);
   }
 }
 
-async function putDedupe(dedupeKv: KVNamespace, postId: string): Promise<void> {
-  try {
-    await dedupeKv.put(dedupeKey(postId), "1", {
-      expirationTtl: dedupeTtlSeconds,
-    });
-  } catch (error) {
-    console.error("KV dedupe write failed", {
-      postId,
-      error: errorMessage(error),
-    });
+async function lookupPost(candidate: PostCandidate, env: Env): Promise<XPost | null> {
+  const url = new URL(`https://api.x.com/2/tweets/${encodeURIComponent(candidate.id)}`);
+  url.searchParams.set("expansions", "author_id");
+  url.searchParams.set("tweet.fields", "created_at");
+  url.searchParams.set("user.fields", "id,name,username");
+
+  const response = await fetch(url, {
+    headers: { authorization: `Bearer ${env.xBearerToken}` },
+  });
+
+  if (!response.ok) {
+    throw new Error(`X post lookup returned ${response.status}`);
   }
+
+  const body: unknown = await response.json();
+  if (!isRecord(body)) {
+    return null;
+  }
+
+  const data = recordField(body, "data");
+  if (data === null) {
+    return null;
+  }
+
+  const text = candidate.text ?? stringField(data, "text");
+  const authorId = idField(data, "author_id");
+  const username =
+    candidate.username ?? usernameFromIncludes(recordField(body, "includes"), authorId);
+
+  return text === null || username === null
+    ? null
+    : {
+        id: candidate.id,
+        text,
+        username,
+      };
 }
 
-async function forwardToSlack(candidate: PostCandidate, env: Env): Promise<void> {
+async function processCandidate(
+  candidate: PostCandidate,
+  env: Env,
+  dedupe: DedupeStore,
+): Promise<void> {
   console.info("Processing X post candidate", candidateSummary(candidate));
 
-  if (await isDuplicate(env.DEDUPE_KV, candidate.id)) {
-    console.info("Skipping duplicate X post", {
-      postId: candidate.id,
-    });
+  if (await dedupe.isDuplicate(candidate.id)) {
+    console.info("Skipping duplicate X post", { postId: candidate.id });
     return;
   }
 
-  let post: XPost | null;
-  try {
-    post = await resolvePost(candidate, env.X_BEARER_TOKEN);
-  } catch (error) {
-    console.error("X post lookup failed; skipping incomplete event", {
-      postId: candidate.id,
-      error: errorMessage(error),
-    });
-    return;
-  }
-
+  let post = postFromCandidate(candidate);
   if (post === null) {
-    console.error("X event did not include enough post data", {
+    console.info("X stream event needs post lookup", {
       postId: candidate.id,
       candidate: candidateSummary(candidate),
     });
-    return;
+
+    try {
+      post = await lookupPost(candidate, env);
+    } catch (error) {
+      console.error("X post lookup failed", {
+        postId: candidate.id,
+        error: errorMessage(error),
+      });
+      return;
+    }
+
+    if (post === null) {
+      console.error("X post lookup did not return enough post data", {
+        postId: candidate.id,
+        candidate: candidateSummary(candidate),
+      });
+      return;
+    }
   }
 
   console.info("Resolved X post", postSummary(post));
 
-  const config = await getClassifierConfig(env.DEDUPE_KV);
+  const config = await getClassifierConfig(env.configPath);
   console.info("Loaded classifier config", {
     postId: post.id,
     enabled: config.enabled,
@@ -550,119 +561,203 @@ async function forwardToSlack(candidate: PostCandidate, env: Env): Promise<void>
   });
 
   if (config.enabled) {
-    try {
-      const shouldForward = await shouldForwardToSlack(
-        post,
-        env.GOOGLE_GENERATIVE_AI_API_KEY,
-        config.prompt ?? defaultClassifierPrompt,
+    if (env.googleApiKey === null) {
+      console.error(
+        "GOOGLE_GENERATIVE_AI_API_KEY is missing while classification is enabled; skipping post",
+        {
+          postId: post.id,
+        },
       );
-      if (!shouldForward) {
-        console.info("AI classifier skipped X post", postSummary(post));
-        await putDedupe(env.DEDUPE_KV, post.id);
-        return;
-      }
+      return;
+    } else {
+      try {
+        const shouldForward = await shouldForwardToSlack(
+          post,
+          env.googleApiKey,
+          config.prompt ?? defaultClassifierPrompt,
+        );
+        if (!shouldForward) {
+          console.info("AI classifier skipped X post", postSummary(post));
+          await dedupe.put(post.id);
+          return;
+        }
 
-      console.info("AI classifier approved X post", postSummary(post));
-    } catch (error) {
-      console.error("AI classification failed; forwarding post", {
-        postId: post.id,
-        username: post.username,
-        error: errorMessage(error),
-      });
+        console.info("AI classifier approved X post", postSummary(post));
+      } catch (error) {
+        console.error("AI classification failed; forwarding post", {
+          postId: post.id,
+          username: post.username,
+          error: errorMessage(error),
+        });
+      }
     }
   } else {
     console.info("AI classification disabled; forwarding X post", postSummary(post));
   }
 
   console.info("Posting X post to Slack", postSummary(post));
-  const response = await fetch(env.SLACK_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text: slackMessage(post) }),
+  await postToSlack(post, env.slackWebhookUrl);
+  console.info("Slack webhook accepted X post", postSummary(post));
+  await dedupe.put(post.id);
+}
+
+export async function processActivityEvent(
+  value: unknown,
+  env: Env,
+  dedupe: DedupeStore,
+): Promise<void> {
+  const candidates = candidatesFromActivityEvent(value);
+  console.info("X Activity stream event received", {
+    event: describeEvent(value),
+    candidateCount: candidates.length,
+    candidates: candidates.map(candidateSummary),
+  });
+
+  if (candidates.length === 0) {
+    console.warn("X Activity stream event did not contain a supported post payload", {
+      event: describeEvent(value),
+    });
+    return;
+  }
+
+  for (const next of candidates) {
+    await processCandidate(next, env, dedupe);
+  }
+}
+
+export async function* streamLines(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) {
+        break;
+      }
+
+      buffer += decoder.decode(result.value, { stream: true });
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        if (line !== "") {
+          yield line;
+        }
+        newlineIndex = buffer.indexOf("\n");
+      }
+    }
+
+    buffer += decoder.decode();
+    const line = buffer.trim();
+    if (line !== "") {
+      yield line;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function connectActivityStream(
+  env: Env,
+  dedupe: DedupeStore,
+  signal: AbortSignal,
+): Promise<void> {
+  console.info("Connecting to X Activity stream");
+  const response = await fetch(activityStreamUrl, {
+    headers: { authorization: `Bearer ${env.xBearerToken}` },
+    signal,
   });
 
   if (!response.ok) {
-    console.error("Slack webhook rejected X post", {
-      ...postSummary(post),
-      status: response.status,
-    });
-    throw new Error(`Slack webhook returned ${response.status}`);
+    const text = await response.text();
+    throw new Error(`X Activity stream returned ${response.status}: ${text.slice(0, 1000)}`);
   }
 
-  console.info("Slack webhook accepted X post", {
-    ...postSummary(post),
-    status: response.status,
-  });
-  await putDedupe(env.DEDUPE_KV, post.id);
+  if (response.body === null) {
+    throw new Error("X Activity stream response had no body");
+  }
+
+  console.info("Connected to X Activity stream");
+  for await (const line of streamLines(response.body)) {
+    let value: unknown;
+    try {
+      value = JSON.parse(line);
+    } catch (error) {
+      console.error("Could not parse X Activity stream line as JSON", {
+        error: errorMessage(error),
+        lineLength: line.length,
+      });
+      continue;
+    }
+
+    await processActivityEvent(value, env, dedupe);
+  }
+
+  throw new Error("X Activity stream ended");
 }
 
-export default {
-  async fetch(request, env, ctx): Promise<Response> {
-    const url = new URL(request.url);
-    if (url.pathname !== "/webhook") {
-      return new Response("Not found", { status: 404 });
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error("Aborted"));
+      return;
     }
 
-    if (request.method === "GET") {
-      const token = url.searchParams.get("crc_token");
-      if (token === null) {
-        return new Response("Missing crc_token", { status: 400 });
+    const timeout = setTimeout(resolve, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timeout);
+        reject(new Error("Aborted"));
+      },
+      { once: true },
+    );
+  });
+}
+
+export async function run(signal: AbortSignal): Promise<void> {
+  const env = readEnv();
+  const dedupe = new DedupeStore(env.dedupePath);
+  await dedupe.load();
+  await getClassifierConfig(env.configPath);
+
+  let backoffMs = 1000;
+  while (!signal.aborted) {
+    try {
+      await connectActivityStream(env, dedupe, signal);
+      backoffMs = 1000;
+    } catch (error) {
+      if (signal.aborted) {
+        return;
       }
 
-      ctx.waitUntil(getClassifierConfig(env.DEDUPE_KV));
-      return crcResponse(token, env.X_CONSUMER_SECRET);
-    }
-
-    if (request.method !== "POST") {
-      return new Response("Method not allowed", {
-        status: 405,
-        headers: { allow: "GET, POST" },
+      console.error("X Activity stream connection failed", {
+        error: errorMessage(error),
+        retryInMs: backoffMs,
       });
+      await sleep(backoffMs, signal);
+      backoffMs = Math.min(backoffMs * 2, 60_000);
     }
+  }
+}
 
-    const body = await request.arrayBuffer();
-    if (
-      !(await hasValidSignature(
-        body,
-        request.headers.get("x-twitter-webhooks-signature"),
-        env.X_CONSUMER_SECRET,
-      ))
-    ) {
-      return new Response("Unauthorized", { status: 401 });
-    }
+function isDirectRun(): boolean {
+  return process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+}
 
-    let event: unknown;
-    try {
-      event = JSON.parse(decoder.decode(body));
-    } catch {
-      return new Response("Invalid JSON", { status: 400 });
-    }
-
-    const candidates = candidatesFromWebhookEvent(event);
-    console.info("Signed X webhook event accepted", {
-      bodyBytes: body.byteLength,
-      event: describeEvent(event),
-      candidateCount: candidates.length,
-      candidates: candidates.map(candidateSummary),
+if (isDirectRun()) {
+  const controller = new AbortController();
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.once(signal, () => {
+      console.info(`Received ${signal}; shutting down`);
+      controller.abort();
     });
+  }
 
-    if (candidates.length === 0) {
-      console.warn("Signed X webhook event did not contain a supported post payload", {
-        event: describeEvent(event),
-      });
-    }
-
-    for (const next of candidates) {
-      ctx.waitUntil(
-        forwardToSlack(next, env).catch((error: unknown) => {
-          console.error("Failed to process X post candidate", {
-            candidate: candidateSummary(next),
-            error: errorMessage(error),
-          });
-        }),
-      );
-    }
-
-    return new Response("OK");
-  },
-} satisfies ExportedHandler<Env>;
+  run(controller.signal).catch((error: unknown) => {
+    console.error("Fatal error", { error: errorMessage(error) });
+    process.exitCode = 1;
+  });
+}

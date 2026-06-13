@@ -1,39 +1,53 @@
 # Slack Tweet Forwarder
 
-`X Activity API post.create subscriptions → Cloudflare Worker → configurable Gemini classifier → Slack incoming webhook`
+`X Activity API subscriptions → persistent Node stream consumer → optional Gemini classifier → Slack incoming webhook`
 
-## Deploy
+## Run on a VPS
 
 ```sh
 pnpm install
-pnpm wrangler kv namespace create DEDUPE_KV
-pnpm wrangler secret put X_CONSUMER_SECRET
-pnpm wrangler secret put X_BEARER_TOKEN
-pnpm wrangler secret put SLACK_WEBHOOK_URL
-pnpm wrangler secret put GOOGLE_GENERATIVE_AI_API_KEY
-pnpm deploy
+pnpm build
+
+X_BEARER_TOKEN=... \
+SLACK_WEBHOOK_URL=... \
+GOOGLE_GENERATIVE_AI_API_KEY=... \
+pnpm start
 ```
 
-Copy the KV namespace `id` from `wrangler kv namespace create` into `wrangler.jsonc`.
-`X_CONSUMER_SECRET` is the X app consumer secret (API secret key), not its bearer token.
-`X_BEARER_TOKEN` is the app-only bearer token used only as a fallback when an activity event does not include full post data.
-`GOOGLE_GENERATIVE_AI_API_KEY` is configured as a required secret; classification can still be turned off in KV while testing.
+`GOOGLE_GENERATIVE_AI_API_KEY` is needed while classification is enabled. To start without it for testing, create `data/classifier-config.json` with `enabled: false`.
+
+## Docker
+
+```sh
+mkdir -p data
+sudo chown -R 1000:1000 data
+docker build -t slack-tweet-forwarder .
+docker run -d --name slack-tweet-forwarder --restart unless-stopped \
+  -e X_BEARER_TOKEN=... \
+  -e SLACK_WEBHOOK_URL=... \
+  -e GOOGLE_GENERATIVE_AI_API_KEY=... \
+  -v "$PWD/data:/app/data" \
+  slack-tweet-forwarder
+```
+
+Optional paths:
+
+- `CONFIG_PATH` defaults to `/app/data/classifier-config.json` in Docker and `data/classifier-config.json` locally.
+- `DEDUPE_PATH` defaults to `/app/data/dedupe.json` in Docker and `data/dedupe.json` locally.
 
 ## Track profiles
 
-The Worker must be deployed before registering a webhook because X immediately sends a CRC request. Pass the webhook ID from the X dashboard, or pass the Worker webhook URL and the script will reuse/register it if your app can call the Webhooks API.
+Create or replace X Activity API `post.create` subscriptions for the handles you want on the persistent stream:
 
 ```sh
-BEARER_TOKEN=... ./scripts/setup.sh \
-  2065826940074729473 \
-  handle1 handle2
+BEARER_TOKEN=... ./scripts/setup.sh handle1 handle2
 ```
 
-Rerunning `setup.sh` with a new handle list replaces the tracked profiles.
+Rerunning `setup.sh` with a new handle list replaces the tracked profiles tagged `tracked-profiles`.
 
 ## Classifier config
 
-The Worker creates `config:classifier` in `DEDUPE_KV` if it is missing:
+The app creates this JSON file on first start if it is missing:
 
 ```json
 {
@@ -42,9 +56,9 @@ The Worker creates `config:classifier` in `DEDUPE_KV` if it is missing:
 }
 ```
 
-Use `prompt: null` for the built-in prompt, set a string to override it, or set `enabled: false` to forward without classification while testing:
+Use `prompt: null` for the built-in prompt, set a string to override it, or set `enabled: false` to forward without AI classification while testing:
 
 ```sh
-pnpm wrangler kv key put config:classifier '{"enabled":false,"prompt":null}' \
-  --binding DEDUPE_KV --remote
+mkdir -p data
+printf '%s\n' '{"enabled":false,"prompt":null}' > data/classifier-config.json
 ```
