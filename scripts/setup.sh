@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -z "${BEARER_TOKEN:-}" || $# -lt 1 ]]; then
-  echo "Usage: BEARER_TOKEN=... $0 <handle> [handle ...]" >&2
+config_path=${1:-config.json}
+
+if [[ -z "${BEARER_TOKEN:-}" ]]; then
+  echo "Usage: BEARER_TOKEN=... $0 [config-path]" >&2
   exit 1
 fi
 
@@ -13,21 +15,50 @@ for command in curl jq; do
   }
 done
 
-handles=()
-for handle in "$@"; do
-  handle=${handle#@}
-  if [[ ! "$handle" =~ ^[A-Za-z0-9_]{1,15}$ ]]; then
-    echo "Invalid X handle: $handle" >&2
+if [[ ! -f "$config_path" ]]; then
+  echo "Config file does not exist: $config_path" >&2
+  exit 1
+fi
+
+author_handles=()
+while IFS= read -r handle; do
+  author_handles+=("$handle")
+done < <(jq -er '.tracking.authors[]' "$config_path")
+
+mention_handles=()
+while IFS= read -r handle; do
+  mention_handles+=("$handle")
+done < <(jq -er '.tracking.mentions[]' "$config_path")
+
+validate_handles() {
+  local label=$1
+  shift
+
+  if (( $# == 0 )); then
+    echo "$label must contain at least one handle" >&2
     exit 1
   fi
-  handles+=("$handle")
-done
+
+  local handle
+  for handle in "$@"; do
+    if [[ ! "$handle" =~ ^[A-Za-z0-9_]{1,15}$ ]]; then
+      echo "Invalid X handle in $label: $handle" >&2
+      exit 1
+    fi
+  done
+}
+
+validate_handles tracking.authors "${author_handles[@]}"
+validate_handles tracking.mentions "${mention_handles[@]}"
 
 api=https://api.x.com/2
 auth=(-H "Authorization: Bearer $BEARER_TOKEN")
 json=(-H "Content-Type: application/json")
-tag=tracked-profiles
-event_type=post.create
+activity_tag=tracked-profiles
+activity_event_type=post.create
+mention_tag=slack-tweet-forwarder:mentions
+legacy_filtered_tag=tracked-profiles
+rules_url="$api/tweets/search/stream/rules"
 
 x_request() {
   local method=$1
@@ -52,9 +83,7 @@ x_request() {
 
   if (( curl_status != 0 )); then
     echo "X API request failed before receiving an HTTP response: $method $url" >&2
-    if [[ -s "$response" ]]; then
-      cat "$response" >&2
-    fi
+    [[ -s "$response" ]] && cat "$response" >&2
     rm -f "$response"
     exit 1
   fi
@@ -73,7 +102,7 @@ x_request() {
 }
 
 user_ids=()
-for handle in "${handles[@]}"; do
+for handle in "${author_handles[@]}"; do
   user=$(x_request GET "$api/users/by/username/$handle")
   user_id=$(jq -r '.data.id // empty' <<<"$user")
   if [[ -z "$user_id" ]]; then
@@ -91,8 +120,8 @@ while IFS= read -r subscription_id; do
   x_request DELETE "$api/activity/subscriptions/$subscription_id" >/dev/null
 done < <(
   jq -r \
-    --arg tag "$tag" \
-    --arg event_type "$event_type" \
+    --arg tag "$activity_tag" \
+    --arg event_type "$activity_event_type" \
     --argjson desired "$desired_ids" '
     (.data // [])
     | .[]
@@ -105,13 +134,13 @@ done < <(
   ' <<<"$subscriptions"
 )
 
-for index in "${!handles[@]}"; do
-  handle=${handles[$index]}
+for index in "${!author_handles[@]}"; do
+  handle=${author_handles[$index]}
   user_id=${user_ids[$index]}
   subscription_id=$(jq -r \
-    --arg event_type "$event_type" \
+    --arg event_type "$activity_event_type" \
     --arg user_id "$user_id" \
-    --arg tag "$tag" '
+    --arg tag "$activity_tag" '
       (.data // [])
       | .[]
       | select(.event_type == $event_type)
@@ -121,22 +150,59 @@ for index in "${!handles[@]}"; do
       | .subscription_id
     ' <<<"$subscriptions" | head -n 1)
 
-  payload=$(jq -cn \
-    --arg event_type "$event_type" \
-    --arg user_id "$user_id" \
-    --arg tag "$tag" \
-    '{
-      event_type: $event_type,
-      filter: {user_id: $user_id},
-      tag: $tag
-    }')
-
   if [[ -n "$subscription_id" ]]; then
-    update_payload=$(jq -cn --arg tag "$tag" '{tag: $tag}')
-    x_request PUT "$api/activity/subscriptions/$subscription_id" "$update_payload" >/dev/null
+    payload=$(jq -cn --arg tag "$activity_tag" '{tag: $tag}')
+    x_request PUT "$api/activity/subscriptions/$subscription_id" "$payload" >/dev/null
   else
+    payload=$(jq -cn \
+      --arg event_type "$activity_event_type" \
+      --arg user_id "$user_id" \
+      --arg tag "$activity_tag" \
+      '{event_type: $event_type, filter: {user_id: $user_id}, tag: $tag}')
     x_request POST "$api/activity/subscriptions" "$payload" >/dev/null
   fi
 
-  echo "Tracking @$handle ($user_id) on the X Activity stream"
+  echo "Tracking authored posts from @$handle ($user_id)"
+done
+
+mention_rule=$(printf '@%s\n' "${mention_handles[@]}" | paste -sd'|' - | sed 's/|/ OR /g')
+if (( ${#mention_rule} > 1024 )); then
+  echo "Mention rule exceeds X's 1024-character limit" >&2
+  exit 1
+fi
+
+rules=$(x_request GET "$rules_url")
+delete_payload=$(jq -cn \
+  --arg tag "$mention_tag" \
+  --arg legacy_tag "$legacy_filtered_tag" \
+  --arg value "$mention_rule" \
+  --argjson rules "$(jq '.data // []' <<<"$rules")" '
+    {delete: {ids: [
+      $rules[]
+      | select(
+          .tag == $legacy_tag
+          or (.tag == $tag and .value != $value)
+        )
+      | .id
+    ]}}
+  ')
+
+if (( $(jq '.delete.ids | length' <<<"$delete_payload") > 0 )); then
+  x_request POST "$rules_url" "$delete_payload" >/dev/null
+fi
+
+has_mention_rule=$(jq -r \
+  --arg tag "$mention_tag" \
+  --arg value "$mention_rule" \
+  'any(.data[]?; .tag == $tag and .value == $value)' <<<"$rules")
+if [[ "$has_mention_rule" != true ]]; then
+  add_payload=$(jq -cn \
+    --arg tag "$mention_tag" \
+    --arg value "$mention_rule" \
+    '{add: [{value: $value, tag: $tag}]}')
+  x_request POST "$rules_url" "$add_payload" >/dev/null
+fi
+
+for handle in "${mention_handles[@]}"; do
+  echo "Tracking direct mentions of @$handle"
 done

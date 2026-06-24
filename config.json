@@ -1,0 +1,20 @@
+{
+  "tracking": {
+    "authors": [
+      "vishyfishy2",
+      "xPolarrr",
+      "0xluffy",
+      "lordspline",
+      "justinsunyt",
+      "scrapybara",
+      "capydotai",
+      "_technodev",
+      "itsasuiii"
+    ],
+    "mentions": ["capydotai"]
+  },
+  "classifier": {
+    "enabled": false,
+    "prompt": null
+  }
+}
