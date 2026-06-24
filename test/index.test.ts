@@ -5,13 +5,16 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   candidatesFromActivityEvent,
+  candidatesFromMentionEvent,
   DedupeStore,
-  getClassifierConfig,
+  getAppConfig,
   processActivityEvent,
+  processMentionEvent,
   run,
+  SerialPostProcessor,
   slackMessage,
   streamLines,
-  type Env,
+  type Runtime,
 } from "../src/index.js";
 
 const sampleEvent = {
@@ -46,6 +49,21 @@ const sampleEvent = {
   },
 };
 
+const sampleMentionEvent = {
+  data: {
+    id: "2067000000000000000",
+    text: "hello @capydotai",
+    author_id: "99",
+    entities: {
+      mentions: [{ start: 6, end: 16, username: "capydotai", id: "88" }],
+    },
+  },
+  includes: {
+    users: [{ id: "99", username: "mentioner", name: "Mentioner" }],
+  },
+  matching_rules: [{ id: "1", tag: "slack-tweet-forwarder:mentions" }],
+};
+
 type FetchCall = {
   url: string;
   method: string;
@@ -61,9 +79,15 @@ async function withTempDir<T>(callback: (path: string) => Promise<T>): Promise<T
   }
 }
 
-async function createEnv(path: string, config: unknown): Promise<Env> {
-  const configPath = join(path, "classifier-config.json");
-  await writeFile(configPath, `${JSON.stringify(config)}\n`);
+async function createRuntime(path: string, classifier: unknown): Promise<Runtime> {
+  const configPath = join(path, "config.json");
+  await writeFile(
+    configPath,
+    `${JSON.stringify({
+      tracking: { authors: ["tracked_author"], mentions: ["capydotai"] },
+      classifier,
+    })}\n`,
+  );
   return {
     xBearerToken: "x-token",
     slackWebhookUrl: "https://hooks.slack.test/services/example",
@@ -92,6 +116,15 @@ async function loadDedupe(path: string): Promise<DedupeStore> {
   return dedupe;
 }
 
+async function createProcessor(
+  path: string,
+  classifier: unknown,
+): Promise<{ runtime: Runtime; dedupe: DedupeStore; processor: SerialPostProcessor }> {
+  const runtime = await createRuntime(path, classifier);
+  const dedupe = await loadDedupe(path);
+  return { runtime, dedupe, processor: new SerialPostProcessor(runtime, dedupe) };
+}
+
 async function withEnv<T>(values: Record<string, string>, callback: () => Promise<T>): Promise<T> {
   const original = new Map<string, string | undefined>();
   for (const [key, value] of Object.entries(values)) {
@@ -112,6 +145,16 @@ async function withEnv<T>(values: Record<string, string>, callback: () => Promis
   }
 }
 
+async function withWorkingDirectory<T>(path: string, callback: () => Promise<T>): Promise<T> {
+  const original = process.cwd();
+  process.chdir(path);
+  try {
+    return await callback();
+  } finally {
+    process.chdir(original);
+  }
+}
+
 test("extracts the captured X Activity post.create stream payload", () => {
   assert.deepEqual(candidatesFromActivityEvent(sampleEvent), [
     {
@@ -120,6 +163,40 @@ test("extracts the captured X Activity post.create stream payload", () => {
       username: "vishyfishy2",
     },
   ]);
+});
+
+test("extracts direct mentions from the tagged Filtered Stream rule", () => {
+  assert.deepEqual(candidatesFromMentionEvent(sampleMentionEvent, new Set(["capydotai"])), [
+    {
+      id: "2067000000000000000",
+      text: "hello @capydotai",
+      username: "mentioner",
+    },
+  ]);
+});
+
+test("ignores unowned rules and quoted-content false positives", () => {
+  assert.deepEqual(
+    candidatesFromMentionEvent(
+      { ...sampleMentionEvent, matching_rules: [{ id: "2", tag: "someone-else" }] },
+      new Set(["capydotai"]),
+    ),
+    [],
+  );
+  assert.deepEqual(
+    candidatesFromMentionEvent(
+      {
+        ...sampleMentionEvent,
+        data: { ...sampleMentionEvent.data, entities: {} },
+        includes: {
+          ...sampleMentionEvent.includes,
+          tweets: [sampleMentionEvent.data],
+        },
+      },
+      new Set(["capydotai"]),
+    ),
+    [],
+  );
 });
 
 test("formats Slack messages as a bare X status URL for unfurling", () => {
@@ -133,13 +210,12 @@ test("formats Slack messages as a bare X status URL for unfurling", () => {
   );
 });
 
-test("creates default classifier config when missing", async () => {
+test("loads and validates the application config", async () => {
   await withTempDir(async (path) => {
-    const configPath = join(path, "classifier-config.json");
-    assert.deepEqual(await getClassifierConfig(configPath), { enabled: true, prompt: null });
-    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), {
-      enabled: true,
-      prompt: null,
+    const runtime = await createRuntime(path, { enabled: false, prompt: "" });
+    assert.deepEqual(await getAppConfig(runtime.configPath), {
+      tracking: { authors: ["tracked_author"], mentions: ["capydotai"] },
+      classifier: { enabled: false, prompt: null },
     });
   });
 });
@@ -159,8 +235,10 @@ test("resets invalid dedupe JSON instead of failing startup", async () => {
 
 test("forwards a captured stream post when classification is disabled and suppresses duplicates", async () => {
   await withTempDir(async (path) => {
-    const env = await createEnv(path, { enabled: false, prompt: null });
-    const dedupe = await loadDedupe(path);
+    const { runtime, processor } = await createProcessor(path, {
+      enabled: false,
+      prompt: null,
+    });
     const calls: Array<FetchCall> = [];
 
     await withMockFetch(
@@ -173,19 +251,19 @@ test("forwards a captured stream post when classification is disabled and suppre
         return new Response("ok", { status: 200 });
       },
       async () => {
-        await processActivityEvent(sampleEvent, env, dedupe);
-        await processActivityEvent(sampleEvent, env, dedupe);
+        await processActivityEvent(sampleEvent, processor);
+        await processActivityEvent(sampleEvent, processor);
       },
     );
 
     assert.equal(calls.length, 1);
-    assert.equal(calls[0]?.url, env.slackWebhookUrl);
+    assert.equal(calls[0]?.url, runtime.slackWebhookUrl);
     assert.deepEqual(JSON.parse(calls[0]?.body ?? ""), {
       text: "https://x.com/vishyfishy2/status/2065839641417138368",
       unfurl_links: true,
       unfurl_media: true,
     });
-    const dedupeFile: unknown = JSON.parse(await readFile(env.dedupePath, "utf8"));
+    const dedupeFile: unknown = JSON.parse(await readFile(runtime.dedupePath, "utf8"));
     assert.equal(typeof dedupeFile, "object");
     assert.notEqual(dedupeFile, null);
     assert.equal(
@@ -195,24 +273,21 @@ test("forwards a captured stream post when classification is disabled and suppre
   });
 });
 
-test("does not reject the stream loop when one Slack post fails", async () => {
+test("serializes both streams so overlapping posts are forwarded once", async () => {
   await withTempDir(async (path) => {
-    const env = await createEnv(path, { enabled: false, prompt: null });
-    const dedupe = await loadDedupe(path);
-
-    await withMockFetch(
-      async () => new Response("Slack exploded", { status: 500 }),
-      async () => {
-        await processActivityEvent(sampleEvent, env, dedupe);
+    const { runtime, processor } = await createProcessor(path, {
+      enabled: false,
+      prompt: null,
+    });
+    const overlappingMention = {
+      ...sampleMentionEvent,
+      data: {
+        ...sampleMentionEvent.data,
+        id: sampleEvent.data.payload.id,
+        author_id: sampleEvent.data.payload.author_id,
       },
-    );
-  });
-});
-
-test("does not forward unclassified posts when classification is enabled without a Google key", async () => {
-  await withTempDir(async (path) => {
-    const env = await createEnv(path, { enabled: true, prompt: null });
-    const dedupe = await loadDedupe(path);
+      includes: sampleEvent.data.includes,
+    };
     const calls: Array<FetchCall> = [];
 
     await withMockFetch(
@@ -225,7 +300,47 @@ test("does not forward unclassified posts when classification is enabled without
         return new Response("ok", { status: 200 });
       },
       async () => {
-        await processActivityEvent(sampleEvent, env, dedupe);
+        await Promise.all([
+          processActivityEvent(sampleEvent, processor),
+          processMentionEvent(overlappingMention, new Set(["capydotai"]), processor),
+        ]);
+      },
+    );
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.url, runtime.slackWebhookUrl);
+  });
+});
+
+test("does not reject the stream loop when one Slack post fails", async () => {
+  await withTempDir(async (path) => {
+    const { processor } = await createProcessor(path, { enabled: false, prompt: null });
+
+    await withMockFetch(
+      async () => new Response("Slack exploded", { status: 500 }),
+      async () => {
+        await processActivityEvent(sampleEvent, processor);
+      },
+    );
+  });
+});
+
+test("does not forward unclassified posts when classification is enabled without a Google key", async () => {
+  await withTempDir(async (path) => {
+    const { processor } = await createProcessor(path, { enabled: true, prompt: null });
+    const calls: Array<FetchCall> = [];
+
+    await withMockFetch(
+      async (input, init) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          body: typeof init?.body === "string" ? init.body : null,
+        });
+        return new Response("ok", { status: 200 });
+      },
+      async () => {
+        await processActivityEvent(sampleEvent, processor);
       },
     );
 
@@ -235,39 +350,44 @@ test("does not forward unclassified posts when classification is enabled without
 
 test("shuts down cleanly while waiting to reconnect", async () => {
   await withTempDir(async (path) => {
-    await withEnv(
-      {
-        X_BEARER_TOKEN: "invalid",
-        SLACK_WEBHOOK_URL: "https://hooks.slack.test/services/example",
-        CONFIG_PATH: join(path, "classifier-config.json"),
-        DEDUPE_PATH: join(path, "dedupe.json"),
-      },
-      async () => {
-        await writeFile(join(path, "classifier-config.json"), '{"enabled":false,"prompt":null}\n');
-        const controller = new AbortController();
-        const promise = withMockFetch(
-          async () =>
-            Response.json(
-              {
-                title: "Unauthorized",
-                status: 401,
-              },
-              { status: 401 },
-            ),
-          async () => run(controller.signal),
-        );
-
-        setTimeout(() => controller.abort(), 10);
-        await promise;
-      },
+    await writeFile(
+      join(path, "config.json"),
+      '{"tracking":{"authors":["author"],"mentions":["capydotai"]},"classifier":{"enabled":false,"prompt":null}}\n',
     );
+    await withWorkingDirectory(path, async () => {
+      await withEnv(
+        {
+          X_BEARER_TOKEN: "invalid",
+          SLACK_WEBHOOK_URL: "https://hooks.slack.test/services/example",
+        },
+        async () => {
+          const controller = new AbortController();
+          const promise = withMockFetch(
+            async () =>
+              Response.json(
+                {
+                  title: "Unauthorized",
+                  status: 401,
+                },
+                { status: 401 },
+              ),
+            async () => run(controller.signal),
+          );
+
+          setTimeout(() => controller.abort(), 10);
+          await promise;
+        },
+      );
+    });
   });
 });
 
 test("looks up incomplete stream events before forwarding", async () => {
   await withTempDir(async (path) => {
-    const env = await createEnv(path, { enabled: false, prompt: null });
-    const dedupe = await loadDedupe(path);
+    const { runtime, processor } = await createProcessor(path, {
+      enabled: false,
+      prompt: null,
+    });
     const event = {
       data: {
         event_type: "post.create",
@@ -301,14 +421,14 @@ test("looks up incomplete stream events before forwarding", async () => {
         return new Response("ok", { status: 200 });
       },
       async () => {
-        await processActivityEvent(event, env, dedupe);
+        await processActivityEvent(event, processor);
       },
     );
 
     assert.equal(calls.length, 2);
     assert.equal(calls[0]?.method, "GET");
     assert.match(calls[0]?.url ?? "", /^https:\/\/api\.x\.com\/2\/tweets\/42\?/);
-    assert.equal(calls[1]?.url, env.slackWebhookUrl);
+    assert.equal(calls[1]?.url, runtime.slackWebhookUrl);
     assert.deepEqual(JSON.parse(calls[1]?.body ?? ""), {
       text: "https://x.com/lookup_user/status/42",
       unfurl_links: true,

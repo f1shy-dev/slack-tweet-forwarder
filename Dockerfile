@@ -1,8 +1,6 @@
 FROM node:22-slim
 WORKDIR /app
 ENV NODE_ENV=production
-ENV CONFIG_PATH=/app/data/classifier-config.json
-ENV DEDUPE_PATH=/app/data/dedupe.json
 RUN corepack enable
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile --prod=false
