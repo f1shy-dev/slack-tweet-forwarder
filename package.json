@@ -12,10 +12,6 @@
     "lint": "oxlint .",
     "format": "oxfmt --write ."
   },
-  "dependencies": {
-    "@ai-sdk/google": "^3.0.82",
-    "ai": "^6.0.204"
-  },
   "devDependencies": {
     "@types/node": "^24.10.2",
     "oxfmt": "^0.54.0",

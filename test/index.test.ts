@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 import {
   candidatesFromActivityEvent,
   candidatesFromMentionEvent,
@@ -13,6 +14,7 @@ import {
   run,
   SerialPostProcessor,
   slackMessage,
+  structuralDecision,
   streamLines,
   type Runtime,
 } from "../src/index.js";
@@ -91,7 +93,8 @@ async function createRuntime(path: string, classifier: unknown): Promise<Runtime
   return {
     xBearerToken: "x-token",
     slackWebhookUrl: "https://hooks.slack.test/services/example",
-    googleApiKey: null,
+    gatewayApiKey: null,
+    quietWebhookUrl: null,
     configPath,
     dedupePath: join(path, "dedupe.json"),
   };
@@ -161,6 +164,8 @@ test("extracts the captured X Activity post.create stream payload", () => {
       id: "2065839641417138368",
       text: "meow",
       username: "vishyfishy2",
+      retweetedId: null,
+      kind: "activity",
     },
   ]);
 });
@@ -171,6 +176,8 @@ test("extracts direct mentions from the tagged Filtered Stream rule", () => {
       id: "2067000000000000000",
       text: "hello @capydotai",
       username: "mentioner",
+      retweetedId: null,
+      kind: "mention",
     },
   ]);
 });
@@ -215,7 +222,7 @@ test("loads and validates the application config", async () => {
     const runtime = await createRuntime(path, { enabled: false, prompt: "" });
     assert.deepEqual(await getAppConfig(runtime.configPath), {
       tracking: { authors: ["tracked_author"], mentions: ["capydotai"] },
-      classifier: { enabled: false, prompt: null },
+      classifier: { enabled: false, prompt: null, threshold: 0.7 },
     });
   });
 });
@@ -325,9 +332,9 @@ test("does not reject the stream loop when one Slack post fails", async () => {
   });
 });
 
-test("does not forward unclassified posts when classification is enabled without a Google key", async () => {
+test("does not forward unclassified posts when classification is enabled without a gateway key", async () => {
   await withTempDir(async (path) => {
-    const { processor } = await createProcessor(path, { enabled: true, prompt: null });
+    const { dedupe, processor } = await createProcessor(path, { enabled: true, prompt: null });
     const calls: Array<FetchCall> = [];
 
     await withMockFetch(
@@ -345,6 +352,7 @@ test("does not forward unclassified posts when classification is enabled without
     );
 
     assert.deepEqual(calls, []);
+    assert.equal(await dedupe.isDuplicate(sampleEvent.data.payload.id), false);
   });
 });
 
@@ -453,4 +461,298 @@ test("parses newline-delimited stream chunks", async () => {
   }
 
   assert.deepEqual(lines, ['{"a":1}', '{"b":2}', '{"c":3}']);
+});
+
+const gatewayUrl = "https://ai-gateway.vercel.sh/v4/ai/evaluation-model";
+
+function activityEvent(overrides: {
+  id?: string;
+  username?: string;
+  text?: string;
+  retweetedId?: string | null;
+}) {
+  const id = overrides.id ?? "2065839641417138368";
+  const username = overrides.username ?? "vishyfishy2";
+  const text = overrides.text ?? "meow";
+  return {
+    data: {
+      event_type: "post.create",
+      payload: {
+        id,
+        text,
+        author_id: "7",
+        ...(overrides.retweetedId
+          ? { referenced_tweets: [{ type: "retweeted", id: overrides.retweetedId }] }
+          : {}),
+      },
+      includes: {
+        users: [{ id: "7", username, name: username }],
+      },
+    },
+  };
+}
+
+function jevResponse(probability: number): Response {
+  return Response.json({ answers: { keep: { probability } } });
+}
+
+test("reads a retweeted id from the activity payload", () => {
+  const [candidate] = candidatesFromActivityEvent(
+    activityEvent({ retweetedId: "99", text: "RT @someone: hi" }),
+  );
+  assert.equal(candidate?.retweetedId, "99");
+  assert.equal(candidate?.kind, "activity");
+});
+
+test("forwards an official account without calling Jev", async () => {
+  await withTempDir(async (path) => {
+    const { runtime, processor } = await createProcessor(path, {
+      enabled: true,
+      prompt: null,
+      threshold: 0.7,
+    });
+    const calls: Array<FetchCall> = [];
+
+    await withMockFetch(
+      async (input, init) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          body: typeof init?.body === "string" ? init.body : null,
+        });
+        return new Response("ok", { status: 200 });
+      },
+      async () => {
+        await processActivityEvent(
+          activityEvent({ id: "official-1", username: "capydotai", text: "shipping notes" }),
+          processor,
+        );
+      },
+    );
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.url, runtime.slackWebhookUrl);
+    assert.equal(
+      calls.some((call) => call.url === gatewayUrl),
+      false,
+    );
+  });
+});
+
+test("drops a retweet of an already seen post before Jev", async () => {
+  await withTempDir(async (path) => {
+    const { runtime, dedupe, processor } = await createProcessor(path, {
+      enabled: true,
+      prompt: null,
+    });
+    runtime.quietWebhookUrl = "https://hooks.slack.test/quiet";
+    await dedupe.put("original-1");
+    const calls: Array<FetchCall> = [];
+
+    await withMockFetch(
+      async (input, init) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          body: typeof init?.body === "string" ? init.body : null,
+        });
+        return new Response("ok", { status: 200 });
+      },
+      async () => {
+        await processActivityEvent(
+          activityEvent({
+            id: "rt-1",
+            username: "lordspline",
+            text: "RT @someone: already posted",
+            retweetedId: "original-1",
+          }),
+          processor,
+        );
+      },
+    );
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.url, runtime.quietWebhookUrl);
+    assert.match(calls[0]?.body ?? "", /retweet/);
+    assert.equal(
+      calls.some((call) => call.url === runtime.slackWebhookUrl),
+      false,
+    );
+    assert.equal(
+      calls.some((call) => call.url === gatewayUrl),
+      false,
+    );
+    assert.equal(await dedupe.isDuplicate("rt-1"), true);
+  });
+});
+
+test("forwards when Jev keep probability is at least the threshold", async () => {
+  await withTempDir(async (path) => {
+    const { runtime, processor } = await createProcessor(path, {
+      enabled: true,
+      prompt: null,
+      threshold: 0.7,
+    });
+    runtime.gatewayApiKey = "gateway-key";
+    runtime.quietWebhookUrl = "https://hooks.slack.test/quiet";
+    const calls: Array<FetchCall> = [];
+
+    await withMockFetch(
+      async (input, init) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          body: typeof init?.body === "string" ? init.body : null,
+        });
+        return String(input) === gatewayUrl
+          ? jevResponse(0.91)
+          : new Response("ok", { status: 200 });
+      },
+      async () => {
+        await processActivityEvent(
+          activityEvent({ id: "keep-1", text: "a real question" }),
+          processor,
+        );
+      },
+    );
+
+    assert.equal(calls.filter((call) => call.url === gatewayUrl).length, 1);
+    assert.equal(
+      calls.some((call) => call.url === runtime.slackWebhookUrl),
+      true,
+    );
+    assert.equal(
+      calls.some((call) => call.url === runtime.quietWebhookUrl),
+      false,
+    );
+  });
+});
+
+test("sends a Jev skip to the quiet webhook and not the main channel", async () => {
+  await withTempDir(async (path) => {
+    const { runtime, dedupe, processor } = await createProcessor(path, {
+      enabled: true,
+      prompt: null,
+      threshold: 0.7,
+    });
+    runtime.gatewayApiKey = "gateway-key";
+    runtime.quietWebhookUrl = "https://hooks.slack.test/quiet";
+    const calls: Array<FetchCall> = [];
+
+    await withMockFetch(
+      async (input, init) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          body: typeof init?.body === "string" ? init.body : null,
+        });
+        return String(input) === gatewayUrl
+          ? jevResponse(0.2)
+          : new Response("ok", { status: 200 });
+      },
+      async () => {
+        await processActivityEvent(activityEvent({ id: "skip-1", text: "yes!" }), processor);
+      },
+    );
+
+    assert.equal(
+      calls.some((call) => call.url === runtime.slackWebhookUrl),
+      false,
+    );
+    const quiet = calls.find((call) => call.url === runtime.quietWebhookUrl);
+    assert.match(quiet?.body ?? "", /skip 0\.2/);
+    assert.equal(await dedupe.isDuplicate("skip-1"), true);
+  });
+});
+
+test("holds a post when Jev is down instead of forwarding it", async () => {
+  await withTempDir(async (path) => {
+    const { runtime, dedupe, processor } = await createProcessor(path, {
+      enabled: true,
+      prompt: null,
+    });
+    runtime.gatewayApiKey = "gateway-key";
+    runtime.quietWebhookUrl = "https://hooks.slack.test/quiet";
+    const calls: Array<FetchCall> = [];
+
+    await withMockFetch(
+      async (input, init) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          body: typeof init?.body === "string" ? init.body : null,
+        });
+        if (String(input) === gatewayUrl) {
+          return new Response("unavailable", { status: 503 });
+        }
+        return new Response("ok", { status: 200 });
+      },
+      async () => {
+        await processActivityEvent(
+          activityEvent({ id: "held-1", text: "maybe useful" }),
+          processor,
+        );
+      },
+    );
+
+    assert.equal(calls.filter((call) => call.url === gatewayUrl).length, 3);
+    assert.equal(
+      calls.some((call) => call.url === runtime.slackWebhookUrl),
+      false,
+    );
+    const quiet = calls.find((call) => call.url === runtime.quietWebhookUrl);
+    assert.match(quiet?.body ?? "", /unclassified/);
+    assert.equal(await dedupe.isDuplicate("held-1"), false);
+    const held = await readFile(join(path, "held.jsonl"), "utf8");
+    assert.match(held, /"id":"held-1"/);
+  });
+});
+
+test("hand scores record 22 junk and 8 keep, and collapse beats the official allowlist", () => {
+  const rows = JSON.parse(
+    readFileSync(new URL("./fixtures/hand-scores.json", import.meta.url), "utf8"),
+  ) as Array<{
+    id: string;
+    username: string;
+    verdict: "keep" | "junk";
+    borderline: boolean;
+    retweetedId: string | null;
+  }>;
+  assert.equal(rows.length, 30);
+  assert.equal(rows.filter((row) => row.verdict === "junk").length, 22);
+  assert.equal(rows.filter((row) => row.verdict === "keep").length, 8);
+  assert.deepEqual(
+    rows.filter((row) => row.borderline).map((row) => row.id),
+    ["2102134401651851300", "2102134490797572511", "2102136401479471273"],
+  );
+
+  const seen = new Set<string>();
+  let collapsed = 0;
+  for (const row of rows) {
+    const decision = structuralDecision(row, seen);
+    if (row.retweetedId !== null && seen.has(row.retweetedId)) {
+      assert.equal(decision, "retweet");
+      collapsed += 1;
+    }
+    if (decision === "allowlist") {
+      assert.equal(row.verdict, "keep");
+    }
+    seen.add(row.id);
+    if (row.retweetedId !== null) {
+      seen.add(row.retweetedId);
+    }
+  }
+
+  assert.equal(collapsed, 7);
+  assert.equal(
+    structuralDecision(
+      { username: "capydotai", retweetedId: "2102128216551165979" },
+      new Set(["2102128216551165979"]),
+    ),
+    "retweet",
+  );
+  assert.equal(
+    structuralDecision({ username: "scrapybara", retweetedId: null }, new Set()),
+    "allowlist",
+  );
 });

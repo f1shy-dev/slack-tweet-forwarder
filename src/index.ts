@@ -1,27 +1,36 @@
-import { createGoogleGenerativeAI } from "@ai-sdk/google";
-import { generateText, Output } from "ai";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const modelId = "gemini-3.1-flash-lite";
 const dedupeTtlMs = 60 * 60 * 24 * 1000;
 const activityStreamUrl = "https://api.x.com/2/activity/stream";
 const filteredStreamUrl = "https://api.x.com/2/tweets/search/stream";
 const configPath = "config.json";
 const defaultDedupePath = "data/dedupe.json";
 const mentionRuleTag = "slack-tweet-forwarder:mentions";
-const defaultClassifierPrompt = [
-  "Decide whether this X post should be forwarded into the Slack channel.",
-  "Choose send for substantive, high-signal posts: product/company updates, launches, incidents, security items, technical analysis, research, release notes, hiring/funding/business news, or other posts likely useful to the team.",
-  "Choose skip for low-signal posts: memes, jokes, personal chatter, engagement bait, giveaways, repost prompts, vague replies without context, spam, or anything that does not stand alone.",
-  "When uncertain, choose skip.",
-].join("\n");
+const gatewayUrl = "https://ai-gateway.vercel.sh/v4/ai/evaluation-model";
+const jevModelId = "typesafe-ai/jev";
+const defaultThreshold = 0.7;
+const jevAttempts = 3;
+const jevRetryMs = 500;
+const jevTimeoutMs = 20_000;
+const defaultInstructions =
+  "Should this X post be forwarded into the team's Capy mentions channel?";
+const keepCriteria = {
+  true: "A substantive post about Capy: a product or company update, a real user question, a bug report, a comparison, press, or praise from a notable account that stands on its own.",
+  false:
+    "A retweet of a post already seen, a one-word or emoji reply, a link-only drop, spam, an inside joke, engagement bait, or a competitor ad that does not make a specific claim.",
+};
+
+export const officialHandles = new Set(["capydotai", "scrapybara"]);
+
+export type PostKind = "activity" | "mention";
 
 export type Runtime = {
   xBearerToken: string;
   slackWebhookUrl: string;
-  googleApiKey: string | null;
+  gatewayApiKey: string | null;
+  quietWebhookUrl: string | null;
   configPath: string;
   dedupePath: string;
 };
@@ -30,17 +39,22 @@ export type PostCandidate = {
   id: string;
   text: string | null;
   username: string | null;
+  retweetedId: string | null;
+  kind: PostKind;
 };
 
 export type XPost = {
   id: string;
   text: string;
   username: string;
+  retweetedId: string | null;
+  kind: PostKind;
 };
 
 export type ClassifierConfig = {
   enabled: boolean;
   prompt: string | null;
+  threshold: number;
 };
 
 export type AppConfig = {
@@ -50,6 +64,15 @@ export type AppConfig = {
   };
   classifier: ClassifierConfig;
 };
+
+export type StructuralDecision = "retweet" | "allowlist" | "classify";
+
+class JevRejected extends Error {
+  constructor(status: number) {
+    super(`AI Gateway answered HTTP ${status}`);
+    this.name = "JevRejected";
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -101,7 +124,8 @@ function readRuntime(): Runtime {
   return {
     xBearerToken: requiredEnv("X_BEARER_TOKEN"),
     slackWebhookUrl: requiredEnv("SLACK_WEBHOOK_URL"),
-    googleApiKey: optionalEnv("GOOGLE_GENERATIVE_AI_API_KEY"),
+    gatewayApiKey: optionalEnv("AI_GATEWAY_API_KEY"),
+    quietWebhookUrl: optionalEnv("CAPY_TWEETS_QUIET_WEBHOOK_URL"),
     configPath,
     dedupePath: defaultDedupePath,
   };
@@ -126,6 +150,18 @@ function normalizeHandles(value: unknown, field: string): Array<string> {
   }
 
   return handles;
+}
+
+function thresholdField(classifier: Record<string, unknown>): number {
+  const field = classifier.threshold;
+  if (field === undefined) {
+    return defaultThreshold;
+  }
+  if (typeof field !== "number" || !Number.isFinite(field) || field < 0 || field > 1) {
+    throw new Error("classifier.threshold must be a number from 0 to 1");
+  }
+
+  return field;
 }
 
 export async function getAppConfig(path: string): Promise<AppConfig> {
@@ -157,6 +193,7 @@ export async function getAppConfig(path: string): Promise<AppConfig> {
     classifier: {
       enabled: classifier.enabled,
       prompt: typeof prompt === "string" && prompt.trim() !== "" ? prompt : null,
+      threshold: thresholdField(classifier),
     },
   };
 }
@@ -169,17 +206,32 @@ function usernameFromUser(value: unknown): string | null {
   return stringField(value, "username");
 }
 
+export function retweetedIdFromPost(value: Record<string, unknown>): string | null {
+  for (const reference of arrayField(value, "referenced_tweets")) {
+    if (!isRecord(reference) || stringField(reference, "type") !== "retweeted") {
+      continue;
+    }
+
+    return idField(reference, "id");
+  }
+
+  return null;
+}
+
 function candidate(
   id: string | null,
   text: string | null,
   username: string | null,
+  retweetedId: string | null,
+  kind: PostKind,
 ): PostCandidate | null {
-  return id === null ? null : { id, text, username };
+  return id === null ? null : { id, text, username, retweetedId, kind };
 }
 
 function candidateFromPost(
   value: unknown,
   includes: Record<string, unknown> | null,
+  kind: PostKind,
 ): PostCandidate | null {
   if (!isRecord(value)) {
     return null;
@@ -190,6 +242,8 @@ function candidateFromPost(
     idField(value, "id"),
     stringField(value, "text"),
     stringField(value, "username") ?? usernameFromIncludes(includes, authorId),
+    retweetedIdFromPost(value),
+    kind,
   );
 }
 
@@ -214,7 +268,7 @@ export function candidatesFromActivityEvent(value: unknown): Array<PostCandidate
     return [];
   }
 
-  const post = candidateFromPost(data.payload, recordField(data, "includes"));
+  const post = candidateFromPost(data.payload, recordField(data, "includes"), "activity");
   return post === null ? [] : [post];
 }
 
@@ -249,7 +303,7 @@ export function candidatesFromMentionEvent(
     return [];
   }
 
-  const candidate = candidateFromPost(post, recordField(value, "includes"));
+  const candidate = candidateFromPost(post, recordField(value, "includes"), "mention");
   return candidate === null ? [] : [candidate];
 }
 
@@ -283,6 +337,7 @@ function candidateSummary(candidate: PostCandidate): Record<string, unknown> {
     hasText: candidate.text !== null,
     textLength: candidate.text?.length ?? 0,
     needsLookup: candidate.text === null || candidate.username === null,
+    retweetedId: candidate.retweetedId,
   };
 }
 
@@ -291,6 +346,7 @@ function postSummary(post: XPost): Record<string, unknown> {
     postId: post.id,
     username: post.username,
     textLength: post.text.length,
+    retweetedId: post.retweetedId,
   };
 }
 
@@ -301,6 +357,8 @@ function postFromCandidate(candidate: PostCandidate): XPost | null {
         id: candidate.id,
         text: candidate.text,
         username: candidate.username,
+        retweetedId: candidate.retweetedId,
+        kind: candidate.kind,
       };
 }
 
@@ -395,42 +453,127 @@ export class DedupeStore {
   }
 }
 
-export function slackMessage(post: XPost): string {
+export function slackMessage(post: { id: string; username: string; text?: string }): string {
   const link = `https://x.com/${encodeURIComponent(post.username)}/status/${encodeURIComponent(post.id)}`;
   return link;
 }
 
-function classificationPrompt(post: XPost): string {
-  return [`Author: @${post.username}`, "Post text:", post.text].join("\n");
+export function structuralDecision(
+  post: { username: string; retweetedId: string | null },
+  seenIds: ReadonlySet<string>,
+): StructuralDecision {
+  if (post.retweetedId !== null && seenIds.has(post.retweetedId)) {
+    return "retweet";
+  }
+  if (officialHandles.has(post.username.toLowerCase())) {
+    return "allowlist";
+  }
+
+  return "classify";
 }
 
-async function shouldForwardToSlack(
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function keepProbabilityFromBody(body: unknown): number | null {
+  if (!isRecord(body)) {
+    return null;
+  }
+  const answers = recordField(body, "answers");
+  const keep = answers === null ? null : recordField(answers, "keep");
+  const probability = keep?.probability;
+  return typeof probability === "number" && Number.isFinite(probability) ? probability : null;
+}
+
+async function requestKeepProbability(
   post: XPost,
-  googleApiKey: string,
-  classifierPrompt: string,
-): Promise<boolean> {
-  const google = createGoogleGenerativeAI({ apiKey: googleApiKey });
-  const { output } = await generateText({
-    model: google(modelId),
-    output: Output.choice({
-      name: "SlackForwardDecision",
-      description: "Whether an X post should be forwarded into the Slack channel.",
-      options: ["send", "skip"] as const,
+  apiKey: string,
+  instructions: string,
+  teamAuthor: boolean,
+): Promise<number> {
+  const response = await fetch(gatewayUrl, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+      "ai-gateway-protocol-version": "0.0.1",
+      "ai-gateway-auth-method": "api-key",
+      "ai-evaluation-model-specification-version": "4",
+      "ai-model-id": jevModelId,
+    },
+    body: JSON.stringify({
+      state: {
+        username: post.username,
+        text: post.text,
+        kind: post.kind,
+        team_author: teamAuthor,
+        is_retweet: post.retweetedId !== null,
+      },
+      questions: {
+        keep: {
+          type: "boolean",
+          instructions,
+          criteria: keepCriteria,
+        },
+      },
     }),
-    system: classifierPrompt,
-    temperature: 0,
-    prompt: classificationPrompt(post),
+    signal: AbortSignal.timeout(jevTimeoutMs),
   });
 
-  return output === "send";
+  if (response.status >= 400 && response.status < 500) {
+    throw new JevRejected(response.status);
+  }
+  if (!response.ok) {
+    throw new Error(`AI Gateway answered HTTP ${response.status}`);
+  }
+
+  const probability = keepProbabilityFromBody(await response.json());
+  if (probability === null) {
+    throw new Error("Jev response did not include keep.probability");
+  }
+
+  return probability;
 }
 
-async function postToSlack(post: XPost, webhookUrl: string): Promise<void> {
+async function keepProbability(
+  post: XPost,
+  apiKey: string,
+  instructions: string,
+  teamAuthor: boolean,
+): Promise<number> {
+  let lastError = "Jev did not respond";
+  for (let attempt = 1; attempt <= jevAttempts; attempt++) {
+    if (attempt > 1) {
+      await delay(jevRetryMs * 2 ** (attempt - 2));
+    }
+
+    try {
+      return await requestKeepProbability(post, apiKey, instructions, teamAuthor);
+    } catch (error) {
+      if (error instanceof JevRejected) {
+        throw error;
+      }
+      lastError = errorMessage(error);
+      console.error("Jev request failed", {
+        postId: post.id,
+        attempt,
+        error: lastError,
+      });
+    }
+  }
+
+  throw new Error(lastError);
+}
+
+async function postToSlack(post: XPost, webhookUrl: string, note?: string): Promise<void> {
   const response = await fetch(webhookUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      text: slackMessage(post),
+      text: note === undefined ? slackMessage(post) : `${slackMessage(post)}\n${note}`,
       unfurl_links: true,
       unfurl_media: true,
     }),
@@ -441,10 +584,42 @@ async function postToSlack(post: XPost, webhookUrl: string): Promise<void> {
   }
 }
 
+async function notifyQuiet(post: XPost, webhookUrl: string | null, note: string): Promise<boolean> {
+  if (webhookUrl === null) {
+    return false;
+  }
+
+  try {
+    await postToSlack(post, webhookUrl, note);
+    return true;
+  } catch (error) {
+    console.error("Quiet webhook failed", {
+      postId: post.id,
+      note,
+      error: errorMessage(error),
+    });
+    return false;
+  }
+}
+
+async function holdPost(dedupePath: string, post: XPost, error: string): Promise<void> {
+  const path = join(dirname(dedupePath), "held.jsonl");
+  await mkdir(dirname(path), { recursive: true });
+  await appendFile(
+    path,
+    `${JSON.stringify({
+      id: post.id,
+      username: post.username,
+      text: post.text,
+      error: error.slice(0, 500),
+    })}\n`,
+  );
+}
+
 async function lookupPost(candidate: PostCandidate, runtime: Runtime): Promise<XPost | null> {
   const url = new URL(`https://api.x.com/2/tweets/${encodeURIComponent(candidate.id)}`);
   url.searchParams.set("expansions", "author_id");
-  url.searchParams.set("tweet.fields", "created_at");
+  url.searchParams.set("tweet.fields", "created_at,referenced_tweets");
   url.searchParams.set("user.fields", "id,name,username");
 
   const response = await fetch(url, {
@@ -476,7 +651,49 @@ async function lookupPost(candidate: PostCandidate, runtime: Runtime): Promise<X
         id: candidate.id,
         text,
         username,
+        retweetedId: candidate.retweetedId ?? retweetedIdFromPost(data),
+        kind: candidate.kind,
       };
+}
+
+async function resolveRetweet(post: XPost, runtime: Runtime): Promise<XPost> {
+  if (post.retweetedId !== null || !post.text.startsWith("RT @")) {
+    return post;
+  }
+
+  try {
+    const lookedUp = await lookupPost(
+      {
+        id: post.id,
+        text: post.text,
+        username: post.username,
+        retweetedId: null,
+        kind: post.kind,
+      },
+      runtime,
+    );
+    return lookedUp ?? post;
+  } catch (error) {
+    console.error("Retweet lookup failed", {
+      postId: post.id,
+      error: errorMessage(error),
+    });
+    return post;
+  }
+}
+
+async function remember(post: XPost, dedupe: DedupeStore): Promise<void> {
+  await dedupe.put(post.id);
+  if (post.retweetedId !== null) {
+    await dedupe.put(post.retweetedId);
+  }
+}
+
+async function forwardMain(post: XPost, runtime: Runtime, dedupe: DedupeStore): Promise<void> {
+  console.info("Posting X post to Slack", postSummary(post));
+  await postToSlack(post, runtime.slackWebhookUrl);
+  console.info("Slack webhook accepted X post", postSummary(post));
+  await remember(post, dedupe);
 }
 
 async function processCandidate(
@@ -519,52 +736,69 @@ async function processCandidate(
 
   console.info("Resolved X post", postSummary(post));
 
-  const config = (await getAppConfig(runtime.configPath)).classifier;
+  const config = await getAppConfig(runtime.configPath);
   console.info("Loaded classifier config", {
     postId: post.id,
-    enabled: config.enabled,
-    hasCustomPrompt: config.prompt !== null,
+    enabled: config.classifier.enabled,
+    threshold: config.classifier.threshold,
   });
 
-  if (config.enabled) {
-    if (runtime.googleApiKey === null) {
-      console.error(
-        "GOOGLE_GENERATIVE_AI_API_KEY is missing while classification is enabled; skipping post",
-        {
-          postId: post.id,
-        },
-      );
-      return;
-    } else {
-      try {
-        const shouldForward = await shouldForwardToSlack(
-          post,
-          runtime.googleApiKey,
-          config.prompt ?? defaultClassifierPrompt,
-        );
-        if (!shouldForward) {
-          console.info("AI classifier skipped X post", postSummary(post));
-          await dedupe.put(post.id);
-          return;
-        }
-
-        console.info("AI classifier approved X post", postSummary(post));
-      } catch (error) {
-        console.error("AI classification failed; forwarding post", {
-          postId: post.id,
-          username: post.username,
-          error: errorMessage(error),
-        });
-      }
-    }
-  } else {
+  if (!config.classifier.enabled) {
     console.info("AI classification disabled; forwarding X post", postSummary(post));
+    await forwardMain(post, runtime, dedupe);
+    return;
   }
 
-  console.info("Posting X post to Slack", postSummary(post));
-  await postToSlack(post, runtime.slackWebhookUrl);
-  console.info("Slack webhook accepted X post", postSummary(post));
-  await dedupe.put(post.id);
+  const resolved = await resolveRetweet(post, runtime);
+  const seenIds = new Set<string>();
+  if (resolved.retweetedId !== null && (await dedupe.isDuplicate(resolved.retweetedId))) {
+    seenIds.add(resolved.retweetedId);
+  }
+  const decision = structuralDecision(resolved, seenIds);
+  if (decision === "retweet") {
+    console.info("Collapsed retweet of an already seen post", postSummary(resolved));
+    await notifyQuiet(resolved, runtime.quietWebhookUrl, "retweet");
+    await remember(resolved, dedupe);
+    return;
+  }
+  if (decision === "allowlist") {
+    console.info("Official account allowlist; forwarding without Jev", postSummary(resolved));
+    await forwardMain(resolved, runtime, dedupe);
+    return;
+  }
+
+  if (runtime.gatewayApiKey === null) {
+    console.error("AI_GATEWAY_API_KEY is missing while classification is enabled; holding post", {
+      postId: resolved.id,
+    });
+    return;
+  }
+
+  const authors = new Set(config.tracking.authors.map((handle) => handle.toLowerCase()));
+  try {
+    const probability = await keepProbability(
+      resolved,
+      runtime.gatewayApiKey,
+      config.classifier.prompt ?? defaultInstructions,
+      authors.has(resolved.username.toLowerCase()),
+    );
+    if (probability >= config.classifier.threshold) {
+      console.info("Jev approved X post", { ...postSummary(resolved), probability });
+      await forwardMain(resolved, runtime, dedupe);
+      return;
+    }
+
+    console.info("Jev skipped X post", { ...postSummary(resolved), probability });
+    await notifyQuiet(resolved, runtime.quietWebhookUrl, `skip ${probability}`);
+    await remember(resolved, dedupe);
+  } catch (error) {
+    console.error("Jev classification failed; holding post", {
+      postId: resolved.id,
+      error: errorMessage(error),
+    });
+    await notifyQuiet(resolved, runtime.quietWebhookUrl, "unclassified");
+    await holdPost(runtime.dedupePath, resolved, errorMessage(error));
+  }
 }
 
 export class SerialPostProcessor {
@@ -773,7 +1007,7 @@ async function runStreamLoop(options: StreamOptions): Promise<void> {
 function mentionStreamUrl(): URL {
   const url = new URL(filteredStreamUrl);
   url.searchParams.set("expansions", "author_id");
-  url.searchParams.set("tweet.fields", "author_id,created_at,entities");
+  url.searchParams.set("tweet.fields", "author_id,created_at,entities,referenced_tweets");
   url.searchParams.set("user.fields", "id,name,username");
   return url;
 }

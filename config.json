@@ -14,7 +14,8 @@
     "mentions": ["capydotai"]
   },
   "classifier": {
-    "enabled": false,
-    "prompt": null
+    "enabled": true,
+    "prompt": null,
+    "threshold": 0.7
   }
 }
