@@ -1,0 +1,272 @@
+[
+  {
+    "id": "2102129603066421535",
+    "username": "lordspline",
+    "text": "RT @justinsunyt: can't speak for everyone else, but at capy we have a LOT to ship.",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": "2102129142489661551",
+    "note": "RT of Justin's shipping post"
+  },
+  {
+    "id": "2102130154726449274",
+    "username": "0xluffy",
+    "text": "RT @justinsunyt: can't speak for everyone else, but at capy we have a LOT to ship.",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": "2102129142489661551",
+    "note": "Same RT"
+  },
+  {
+    "id": "2102130206622233018",
+    "username": "justinsunyt",
+    "text": "since launch we've been so busy with our own product and haven't had a lot of time to do head to head comparisons  time to drop some evals",
+    "verdict": "keep",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Team product statement, a quote not a retweet"
+  },
+  {
+    "id": "2102130308049195206",
+    "username": "0xluffy",
+    "text": "@uaaxn @capydotai yes!",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "One-word reply"
+  },
+  {
+    "id": "2102130419538043000",
+    "username": "xPolarrr",
+    "text": "RT @0xluffy: on DeepSWE capy is better, faster AND cheaper than any harnesses you guys use",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": "2102128216551165979",
+    "note": "RT of the DeepSWE post"
+  },
+  {
+    "id": "2102130560709877765",
+    "username": "lordspline",
+    "text": "@Its_lakshya_ai https://capy.ai",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Link-only reply"
+  },
+  {
+    "id": "2102130705832804505",
+    "username": "0xluffy",
+    "text": "RT @justinsunyt: since launch we've been so busy with our own product and haven't had a lot of time to do head to head comparisons",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": "2102130206622233018",
+    "note": "RT of Justin's evals post"
+  },
+  {
+    "id": "2102130748635377838",
+    "username": "amianthus_",
+    "text": "@garrytan @capydotai real recognises real",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Emoji-level agreement"
+  },
+  {
+    "id": "2102130913748697325",
+    "username": "xPolarrr",
+    "text": "RT @justinsunyt: can't speak for everyone else, but at capy we have a LOT to ship.",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": "2102129142489661551",
+    "note": "Another RT of Justin's long post"
+  },
+  {
+    "id": "2102130961177821564",
+    "username": "lordspline",
+    "text": "RT @0xDevShah: @capydotai is goated",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": "2102114451965219134",
+    "note": "RT of a one-line praise post"
+  },
+  {
+    "id": "2102130999983300809",
+    "username": "uaaxn",
+    "text": "@0xluffy @capydotai wow, i didn't know so i'll try capy again, and see how it goes  ty",
+    "verdict": "keep",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Real user intent"
+  },
+  {
+    "id": "2102131022825701432",
+    "username": "xPolarrr",
+    "text": "RT @0xDevShah: @capydotai is goated",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": "2102114451965219134",
+    "note": "Same goated RT"
+  },
+  {
+    "id": "2102131057596280873",
+    "username": "nimdeekan",
+    "text": "RT @garrytan: Not really sure how @capydotai does it, but it really is able to track multi-step workflow and do large PRs faster than Codex or Claude Code on its own.",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": "2102095924893827501",
+    "note": "RT of Garry Tan. The original would be keep"
+  },
+  {
+    "id": "2102131126471188648",
+    "username": "0xluffy",
+    "text": "@uaaxn @capydotai feel free to dm any feedback!",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Team reply with no new information"
+  },
+  {
+    "id": "2102131650721423705",
+    "username": "0xluffy",
+    "text": "@Its_lakshya_ai https://capy.ai",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Link-only reply"
+  },
+  {
+    "id": "2102133855876776124",
+    "username": "0xluffy",
+    "text": "@luongnv89 @garrytan @capydotai yes https://x.com/0xluffy/status/2102128216551165979?s=20",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Yes plus a link to a post already in the channel. A quote, not a retweet"
+  },
+  {
+    "id": "2102134401651851300",
+    "username": "kodahhhhh",
+    "text": "@0xluffy @capydotai it's insane how open and good capy is",
+    "verdict": "keep",
+    "borderline": true,
+    "retweetedId": null,
+    "note": "Short, but a real reaction that stands alone"
+  },
+  {
+    "id": "2102134490797572511",
+    "username": "capydotai",
+    "text": "RT @0xluffy: on DeepSWE capy is better, faster AND cheaper than any harnesses you guys use",
+    "verdict": "keep",
+    "borderline": true,
+    "retweetedId": "2102128216551165979",
+    "note": "Official RT of a post already in the window. Hand score keeps it under the allowlist. Collapse runs first, so a seen original drops it"
+  },
+  {
+    "id": "2102135142064046511",
+    "username": "justinsunyt",
+    "text": "@amianthus_ @0xluffy BDE got that",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Inside joke"
+  },
+  {
+    "id": "2102135788079141186",
+    "username": "bolt_intern",
+    "text": "@0xluffy @capydotai Do you guys have a mobile app? Can i use the harness in the CLI?",
+    "verdict": "keep",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Product question"
+  },
+  {
+    "id": "2102136401479471273",
+    "username": "0xluffy",
+    "text": "@bolt_intern @capydotai mobile app coming soon! for now i use the PWA but it's been pretty smooth you should give it a try  CLI not yet but in the roadmap too",
+    "verdict": "keep",
+    "borderline": true,
+    "retweetedId": null,
+    "note": "Substantive team answer"
+  },
+  {
+    "id": "2102136439194751365",
+    "username": "0xluffy",
+    "text": "@kodahhhhh @capydotai very good",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "One-line reply"
+  },
+  {
+    "id": "2102136596111802800",
+    "username": "irastech",
+    "text": "@garrytan @capydotai the multi-step tracking is what always breaks for me. small tasks are fine, anything past three steps and my agent forgets what it was doing.",
+    "verdict": "keep",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Specific product complaint"
+  },
+  {
+    "id": "2102136628789625129",
+    "username": "theandreilucian",
+    "text": "@garrytan @capydotai been testing it too and the way it handles context across files without losing the thread is pretty wild compared to other tools",
+    "verdict": "keep",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Specific testing note"
+  },
+  {
+    "id": "2102137687557755039",
+    "username": "cantstopnyxia",
+    "text": "@vishyfishy2 @capydotai No that's very easy analysis retard, gpt 3/4 can give you the same answer",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Insult without a specific claim"
+  },
+  {
+    "id": "2102139687720681536",
+    "username": "Sandraptux",
+    "text": "@garrytan @capydotai Hello dear 😘 how are you doing?",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Flirt spam"
+  },
+  {
+    "id": "2102140635868213322",
+    "username": "DanHMcInerney",
+    "text": "@garrytan @capydotai orchflows does this today. Free, open source, runs on the Claude Code or Codex you already have.",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Competitor ad in Garry's thread"
+  },
+  {
+    "id": "2102140658014470349",
+    "username": "MBPBDB",
+    "text": "RT @garrytan: Not really sure how @capydotai does it, but it really is able to track multi-step workflow and do large PRs faster than Codex or Claude Code on its own.",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": "2102095924893827501",
+    "note": "RT of Garry Tan"
+  },
+  {
+    "id": "2102141496833331631",
+    "username": "mhaseeb_shahid",
+    "text": "RT @garrytan: Not really sure how @capydotai does it, but it really is able to track multi-step workflow and do large PRs faster than Codex or Claude Code on its own.",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": "2102095924893827501",
+    "note": "Another RT of Garry Tan"
+  },
+  {
+    "id": "2102142599587156237",
+    "username": "NATE9169",
+    "text": "@garrytan @capydotai i made a pfp for you",
+    "verdict": "junk",
+    "borderline": false,
+    "retweetedId": null,
+    "note": "Profile-picture offer"
+  }
+]
