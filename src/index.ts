@@ -3,6 +3,9 @@ import { generateText, Output } from "ai";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
+import { hydratePosts, refetchMetrics, rehydrateEvents, type Hydrated } from "./ingest.js";
+import { PostStore, type StoredEvent, type StreamSource } from "./store.js";
+import { authorUsername, fullText } from "./x.js";
 
 const modelId = "gemini-3.1-flash-lite";
 const dedupeTtlMs = 60 * 60 * 24 * 1000;
@@ -10,6 +13,8 @@ const activityStreamUrl = "https://api.x.com/2/activity/stream";
 const filteredStreamUrl = "https://api.x.com/2/tweets/search/stream";
 const configPath = "config.json";
 const defaultDedupePath = "data/dedupe.json";
+const defaultStorePath = "data/posts.sqlite";
+const maintenanceIntervalMs = 15 * 60 * 1000;
 const mentionRuleTag = "slack-tweet-forwarder:mentions";
 const defaultClassifierPrompt = [
   "Decide whether this X post should be forwarded into the Slack channel.",
@@ -24,7 +29,15 @@ export type Runtime = {
   googleApiKey: string | null;
   configPath: string;
   dedupePath: string;
+  storePath: string;
 };
+
+export type ForwardOutcome =
+  | "posted"
+  | "duplicate"
+  | "unresolved"
+  | "classifier-skipped"
+  | "classifier-unavailable";
 
 export type PostCandidate = {
   id: string;
@@ -104,6 +117,7 @@ function readRuntime(): Runtime {
     googleApiKey: optionalEnv("GOOGLE_GENERATIVE_AI_API_KEY"),
     configPath,
     dedupePath: defaultDedupePath,
+    storePath: optionalEnv("STORE_PATH") ?? defaultStorePath,
   };
 }
 
@@ -483,12 +497,12 @@ async function processCandidate(
   candidate: PostCandidate,
   runtime: Runtime,
   dedupe: DedupeStore,
-): Promise<void> {
+): Promise<ForwardOutcome> {
   console.info("Processing X post candidate", candidateSummary(candidate));
 
   if (await dedupe.isDuplicate(candidate.id)) {
     console.info("Skipping duplicate X post", { postId: candidate.id });
-    return;
+    return "duplicate";
   }
 
   let post = postFromCandidate(candidate);
@@ -505,7 +519,7 @@ async function processCandidate(
         postId: candidate.id,
         error: errorMessage(error),
       });
-      return;
+      return "unresolved";
     }
 
     if (post === null) {
@@ -513,7 +527,7 @@ async function processCandidate(
         postId: candidate.id,
         candidate: candidateSummary(candidate),
       });
-      return;
+      return "unresolved";
     }
   }
 
@@ -534,7 +548,7 @@ async function processCandidate(
           postId: post.id,
         },
       );
-      return;
+      return "classifier-unavailable";
     } else {
       try {
         const shouldForward = await shouldForwardToSlack(
@@ -545,7 +559,7 @@ async function processCandidate(
         if (!shouldForward) {
           console.info("AI classifier skipped X post", postSummary(post));
           await dedupe.put(post.id);
-          return;
+          return "classifier-skipped";
         }
 
         console.info("AI classifier approved X post", postSummary(post));
@@ -565,22 +579,179 @@ async function processCandidate(
   await postToSlack(post, runtime.slackWebhookUrl);
   console.info("Slack webhook accepted X post", postSummary(post));
   await dedupe.put(post.id);
+  return "posted";
 }
 
 export class SerialPostProcessor {
   readonly #runtime: Runtime;
   readonly #dedupe: DedupeStore;
-  #tail: Promise<void> = Promise.resolve();
+  #tail: Promise<unknown> = Promise.resolve();
 
   constructor(runtime: Runtime, dedupe: DedupeStore) {
     this.#runtime = runtime;
     this.#dedupe = dedupe;
   }
 
-  process(candidate: PostCandidate): Promise<void> {
+  process(candidate: PostCandidate): Promise<ForwardOutcome> {
     const result = this.#tail.then(() => processCandidate(candidate, this.#runtime, this.#dedupe));
     this.#tail = result.catch(() => undefined);
     return result;
+  }
+}
+
+export function postIdsFromEvent(source: StreamSource, value: unknown): Array<string> {
+  if (!isRecord(value)) {
+    return [];
+  }
+
+  const data = recordField(value, "data");
+  const post = data === null ? null : source === "activity" ? recordField(data, "payload") : data;
+  const id = post === null ? null : idField(post, "id");
+  return id === null ? [] : [id];
+}
+
+export function candidatesFromStoredEvent(
+  source: StreamSource,
+  value: unknown,
+  mentionHandles: ReadonlySet<string>,
+): Array<PostCandidate> {
+  return source === "activity"
+    ? candidatesFromActivityEvent(value)
+    : candidatesFromMentionEvent(value, mentionHandles);
+}
+
+export function enrichCandidate(
+  candidate: PostCandidate,
+  hydrated: Hydrated | undefined,
+): PostCandidate {
+  if (hydrated === undefined) {
+    return candidate;
+  }
+
+  return {
+    id: candidate.id,
+    text: fullText(hydrated.post) ?? candidate.text,
+    username: authorUsername(hydrated.post, hydrated.includes) ?? candidate.username,
+  };
+}
+
+function parseLine(line: string): unknown {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+}
+
+export class StoreForwarder {
+  readonly #runtime: Runtime;
+  readonly #store: PostStore;
+  readonly #processor: SerialPostProcessor;
+  readonly #mentionHandles: ReadonlySet<string>;
+  #draining: Promise<void> | null = null;
+  #pending = false;
+
+  constructor(
+    runtime: Runtime,
+    store: PostStore,
+    processor: SerialPostProcessor,
+    mentionHandles: ReadonlySet<string>,
+  ) {
+    this.#runtime = runtime;
+    this.#store = store;
+    this.#processor = processor;
+    this.#mentionHandles = mentionHandles;
+  }
+
+  ingest(source: StreamSource, line: string): Promise<void> {
+    const seq = this.#store.appendEvent(source, line);
+    console.info("Stored X stream event", { source, seq, lineLength: line.length });
+    return this.drain();
+  }
+
+  drain(): Promise<void> {
+    this.#pending = true;
+    if (this.#draining === null) {
+      this.#draining = this.#drainLoop().finally(() => {
+        this.#draining = null;
+      });
+    }
+
+    return this.#draining;
+  }
+
+  async #drainLoop(): Promise<void> {
+    while (this.#pending) {
+      this.#pending = false;
+      for (;;) {
+        const events = this.#store.eventsAfter(this.#store.forwardedThrough());
+        if (events.length === 0) {
+          break;
+        }
+
+        for (const event of events) {
+          await this.#forward(event);
+        }
+      }
+    }
+  }
+
+  async #forward(event: StoredEvent): Promise<void> {
+    const value = parseLine(event.line);
+    if (value === undefined) {
+      console.error(`Could not parse ${event.source} stream line as JSON`, { seq: event.seq });
+      this.#store.appendDelivery(event.seq, null, "unparsed");
+      return;
+    }
+
+    const ids = postIdsFromEvent(event.source, value);
+    let hydrated = new Map<string, Hydrated>();
+    if (ids.length > 0) {
+      try {
+        hydrated = await hydratePosts(
+          this.#store,
+          ids,
+          "stream",
+          event.seq,
+          this.#runtime.xBearerToken,
+        );
+      } catch (error) {
+        console.error("X post hydration failed; forwarding from stream data", {
+          seq: event.seq,
+          postIds: ids,
+          error: errorMessage(error),
+        });
+      }
+    }
+
+    const candidates = candidatesFromStoredEvent(event.source, value, this.#mentionHandles);
+    console.info("Forwarding stored X stream event", {
+      seq: event.seq,
+      source: event.source,
+      event: describeEvent(value),
+      candidateCount: candidates.length,
+    });
+    if (candidates.length === 0) {
+      this.#store.appendDelivery(event.seq, ids[0] ?? null, "ignored");
+      return;
+    }
+
+    for (const candidate of candidates) {
+      let outcome: ForwardOutcome | "failed";
+      try {
+        outcome = await this.#processor.process(
+          enrichCandidate(candidate, hydrated.get(candidate.id)),
+        );
+      } catch (error) {
+        console.error("X post candidate processing failed", {
+          source: event.source,
+          candidate: candidateSummary(candidate),
+          error: errorMessage(error),
+        });
+        outcome = "failed";
+      }
+      this.#store.appendDelivery(event.seq, candidate.id, outcome);
+    }
   }
 }
 
@@ -682,7 +853,7 @@ type StreamOptions = {
   url: URL | string;
   runtime: Runtime;
   signal: AbortSignal;
-  processEvent: (value: unknown) => Promise<void>;
+  processLine: (line: string) => Promise<void>;
 };
 
 async function consumeStream(options: StreamOptions, onConnected: () => void): Promise<void> {
@@ -704,18 +875,9 @@ async function consumeStream(options: StreamOptions, onConnected: () => void): P
   console.info(`Connected to ${options.name}`);
   onConnected();
   for await (const line of streamLines(response.body)) {
-    let value: unknown;
-    try {
-      value = JSON.parse(line);
-    } catch (error) {
-      console.error(`Could not parse ${options.name} line as JSON`, {
-        error: errorMessage(error),
-        lineLength: line.length,
-      });
-      continue;
-    }
-
-    await options.processEvent(value);
+    void options.processLine(line).catch((error: unknown) => {
+      console.error(`Could not store ${options.name} line`, { error: errorMessage(error) });
+    });
   }
 
   throw new Error(`${options.name} ended`);
@@ -785,23 +947,54 @@ export async function run(signal: AbortSignal): Promise<void> {
   const dedupe = new DedupeStore(runtime.dedupePath);
   await dedupe.load();
   const processor = new SerialPostProcessor(runtime, dedupe);
+  const store = new PostStore(runtime.storePath);
+  const forwarder = new StoreForwarder(runtime, store, processor, mentionHandles);
 
-  await Promise.all([
-    runStreamLoop({
-      name: "X Activity stream",
-      url: activityStreamUrl,
-      runtime,
-      signal,
-      processEvent: (value) => processActivityEvent(value, processor),
-    }),
-    runStreamLoop({
-      name: "X mention stream",
-      url: mentionStreamUrl(),
-      runtime,
-      signal,
-      processEvent: (value) => processMentionEvent(value, mentionHandles, processor),
-    }),
-  ]);
+  try {
+    await forwarder.drain();
+    await Promise.all([
+      runStreamLoop({
+        name: "X Activity stream",
+        url: activityStreamUrl,
+        runtime,
+        signal,
+        processLine: (line) => forwarder.ingest("activity", line),
+      }),
+      runStreamLoop({
+        name: "X mention stream",
+        url: mentionStreamUrl(),
+        runtime,
+        signal,
+        processLine: (line) => forwarder.ingest("mentions", line),
+      }),
+      runMaintenanceLoop(store, runtime, signal),
+    ]);
+    await forwarder.drain();
+  } finally {
+    store.close();
+  }
+}
+
+async function runMaintenanceLoop(
+  store: PostStore,
+  runtime: Runtime,
+  signal: AbortSignal,
+): Promise<void> {
+  while (!signal.aborted) {
+    try {
+      const rehydrated = await rehydrateEvents(store, runtime.xBearerToken);
+      const refetched = await refetchMetrics(store, runtime.xBearerToken);
+      console.info("Store maintenance finished", { rehydrated, refetched, ...store.counts() });
+    } catch (error) {
+      console.error("Store maintenance failed", { error: errorMessage(error) });
+    }
+
+    try {
+      await sleep(maintenanceIntervalMs, signal);
+    } catch {
+      return;
+    }
+  }
 }
 
 function isDirectRun(): boolean {
