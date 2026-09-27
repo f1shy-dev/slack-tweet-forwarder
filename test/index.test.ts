@@ -13,9 +13,12 @@ import {
   run,
   SerialPostProcessor,
   slackMessage,
+  StoreForwarder,
   streamLines,
   type Runtime,
 } from "../src/index.js";
+import { refetchMetrics } from "../src/ingest.js";
+import { PostStore } from "../src/store.js";
 
 const sampleEvent = {
   data: {
@@ -94,6 +97,7 @@ async function createRuntime(path: string, classifier: unknown): Promise<Runtime
     googleApiKey: null,
     configPath,
     dedupePath: join(path, "dedupe.json"),
+    storePath: join(path, "posts.sqlite"),
   };
 }
 
@@ -453,4 +457,196 @@ test("parses newline-delimited stream chunks", async () => {
   }
 
   assert.deepEqual(lines, ['{"a":1}', '{"b":2}', '{"c":3}']);
+});
+
+const hydratedPost = {
+  id: "2065839641417138368",
+  text: "meow",
+  author_id: "1232338424381759488",
+  created_at: "2026-06-13T16:52:06.000Z",
+  conversation_id: "2065839641417138368",
+  referenced_tweets: [{ type: "quoted", id: "2065000000000000000" }],
+  entities: { urls: [{ url: "https://t.co/x", expanded_url: "https://capy.ai" }] },
+  attachments: { media_keys: ["3_1"] },
+  public_metrics: { retweet_count: 1, reply_count: 2, like_count: 3, quote_count: 0 },
+};
+
+const hydratedIncludes = {
+  users: [
+    { id: "1232338424381759488", username: "vishyfishy2", name: "f1shy-dev" },
+    { id: "5", username: "unrelated", name: "Unrelated" },
+  ],
+  tweets: [{ id: "2065000000000000000", text: "quoted", author_id: "1232338424381759488" }],
+  media: [{ media_key: "3_1", type: "photo", url: "https://pbs.twimg.com/media/x.jpg" }],
+};
+
+function xLookupResponse(url: string): Response | null {
+  if (!url.startsWith("https://api.x.com/2/tweets?")) {
+    return null;
+  }
+
+  const ids = new URL(url).searchParams.get("ids")?.split(",") ?? [];
+  return Response.json({
+    data: ids.map((id) => ({ ...hydratedPost, id })),
+    includes: hydratedIncludes,
+  });
+}
+
+async function withStoreForwarder<T>(
+  path: string,
+  callback: (context: {
+    runtime: Runtime;
+    store: PostStore;
+    forwarder: StoreForwarder;
+    calls: Array<FetchCall>;
+  }) => Promise<T>,
+): Promise<T> {
+  const { runtime, processor } = await createProcessor(path, { enabled: false, prompt: null });
+  const store = new PostStore(runtime.storePath);
+  const forwarder = new StoreForwarder(runtime, store, processor, new Set(["capydotai"]));
+  const calls: Array<FetchCall> = [];
+  try {
+    return await withMockFetch(
+      async (input, init) => {
+        const url = String(input);
+        calls.push({
+          url,
+          method: init?.method ?? "GET",
+          body: typeof init?.body === "string" ? init.body : null,
+        });
+        return xLookupResponse(url) ?? new Response("ok", { status: 200 });
+      },
+      () => callback({ runtime, store, forwarder, calls }),
+    );
+  } finally {
+    store.close();
+  }
+}
+
+test("stores the raw event and the full hydrated X object before forwarding", async () => {
+  await withTempDir(async (path) => {
+    await withStoreForwarder(path, async ({ runtime, store, forwarder, calls }) => {
+      await forwarder.ingest("activity", JSON.stringify(sampleEvent));
+      await forwarder.ingest("activity", JSON.stringify(sampleEvent));
+
+      const lookup = new URL(calls[0]?.url ?? "");
+      assert.equal(lookup.pathname, "/2/tweets");
+      assert.match(lookup.searchParams.get("tweet.fields") ?? "", /referenced_tweets/);
+      assert.match(lookup.searchParams.get("tweet.fields") ?? "", /public_metrics/);
+      assert.match(lookup.searchParams.get("expansions") ?? "", /attachments\.media_keys/);
+      assert.equal(calls.filter((call) => call.url === runtime.slackWebhookUrl).length, 1);
+
+      const observations = store.observations(hydratedPost.id);
+      assert.equal(observations.length, 2);
+      assert.deepEqual(observations[0]?.post, hydratedPost);
+      assert.equal(observations[0]?.eventSeq, 1);
+      assert.match(observations[0]?.fetchedAt ?? "", /^\d{4}-\d{2}-\d{2}T/);
+      assert.deepEqual(
+        ((observations[0]?.includes?.users ?? []) as Array<{ id: string }>).map((user) => user.id),
+        ["1232338424381759488"],
+      );
+      assert.deepEqual(store.counts(), {
+        events: 2,
+        observations: 2,
+        posts: 1,
+        deliveries: 2,
+        posted: 1,
+      });
+    });
+  });
+});
+
+test("stores and hydrates stream events the forwarder does not select", async () => {
+  await withTempDir(async (path) => {
+    await withStoreForwarder(path, async ({ runtime, store, forwarder, calls }) => {
+      const indirect = {
+        ...sampleMentionEvent,
+        data: { ...sampleMentionEvent.data, id: "77", entities: {} },
+      };
+      await forwarder.ingest("mentions", JSON.stringify(indirect));
+      await forwarder.ingest("mentions", "{not json");
+
+      assert.equal(calls.filter((call) => call.url === runtime.slackWebhookUrl).length, 0);
+      assert.equal(store.observations("77").length, 1);
+      assert.deepEqual(store.counts(), {
+        events: 2,
+        observations: 1,
+        posts: 1,
+        deliveries: 2,
+        posted: 0,
+      });
+    });
+  });
+});
+
+test("forwards stored events that were never delivered after a restart", async () => {
+  await withTempDir(async (path) => {
+    const storePath = join(path, "posts.sqlite");
+    const offline = new PostStore(storePath);
+    offline.appendEvent("activity", JSON.stringify(sampleEvent));
+    offline.close();
+
+    await withStoreForwarder(path, async ({ runtime, store, forwarder, calls }) => {
+      await forwarder.drain();
+      assert.equal(calls.filter((call) => call.url === runtime.slackWebhookUrl).length, 1);
+      assert.equal(store.forwardedThrough(), 1);
+      await forwarder.drain();
+      assert.equal(calls.filter((call) => call.url === runtime.slackWebhookUrl).length, 1);
+    });
+  });
+});
+
+test("rejects updates and deletes on the append-only store", async () => {
+  await withTempDir(async (path) => {
+    const storePath = join(path, "posts.sqlite");
+    const store = new PostStore(storePath);
+    store.appendEvent("activity", "{}");
+    store.close();
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(storePath);
+    assert.throws(() => db.exec("UPDATE events SET line = 'x'"), /append-only/);
+    assert.throws(() => db.exec("DELETE FROM events"), /append-only/);
+    db.close();
+  });
+});
+
+test("re-fetches public_metrics once for non-retweet posts older than 24 hours", async () => {
+  await withTempDir(async (path) => {
+    const store = new PostStore(join(path, "posts.sqlite"));
+    const old = "2026-09-01T00:00:00.000Z";
+    store.appendObservation("1", "stream", { id: "1", text: "original" }, null, null, old);
+    store.appendObservation(
+      "2",
+      "backfill",
+      { id: "2", text: "RT", referenced_tweets: [{ type: "retweeted", id: "1" }] },
+      null,
+      null,
+      old,
+    );
+    store.appendObservation("3", "stream", { id: "3", text: "fresh" }, null);
+    store.appendObservation("4", "backfill", { id: "4", text: "deleted later" }, null, null, old);
+    const urls: Array<string> = [];
+
+    await withMockFetch(
+      async (input) => {
+        urls.push(String(input));
+        return Response.json({
+          data: [{ id: "1", text: "original", public_metrics: { like_count: 9 } }],
+          errors: [{ resource_id: "4", title: "Not Found Error" }],
+        });
+      },
+      async () => {
+        assert.equal(await refetchMetrics(store, "x-token", Date.parse("2026-09-03T00:00:00Z")), 2);
+        assert.equal(await refetchMetrics(store, "x-token", Date.parse("2026-09-03T00:00:00Z")), 0);
+      },
+    );
+
+    assert.equal(urls.length, 1);
+    assert.deepEqual(new URL(urls[0] ?? "").searchParams.get("ids")?.split(","), ["1", "4"]);
+    assert.equal(new URL(urls[0] ?? "").searchParams.get("expansions"), null);
+    assert.deepEqual(store.observations("1").at(-1)?.post.public_metrics, { like_count: 9 });
+    assert.equal(store.observations("4").at(-1)?.post.unavailable, true);
+    assert.equal(store.observations("2").length, 1);
+    store.close();
+  });
 });
