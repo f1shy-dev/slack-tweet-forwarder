@@ -8,10 +8,12 @@
       "justinsunyt",
       "scrapybara",
       "capydotai",
-      "_technodev",
-      "itsasuiii"
+      "itsasuiii",
+      "jamiepine"
     ],
-    "mentions": ["capydotai"]
+    "mentions": [
+      "capydotai"
+    ]
   },
   "classifier": {
     "enabled": false,
