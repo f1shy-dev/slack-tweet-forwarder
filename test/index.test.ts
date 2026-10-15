@@ -210,7 +210,7 @@ test("formats Slack messages as a bare X status URL for unfurling", () => {
       username: "fish&chips",
       text: "one & <two>\nthree",
     }),
-    "https://x.com/fish%26chips/status/123",
+    "https://fixupx.com/fish%26chips/status/123",
   );
 });
 
@@ -263,7 +263,7 @@ test("forwards a captured stream post when classification is disabled and suppre
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.url, runtime.slackWebhookUrl);
     assert.deepEqual(JSON.parse(calls[0]?.body ?? ""), {
-      text: "https://x.com/vishyfishy2/status/2065839641417138368",
+      text: "https://fixupx.com/vishyfishy2/status/2065839641417138368",
       unfurl_links: true,
       unfurl_media: true,
     });
@@ -434,7 +434,7 @@ test("looks up incomplete stream events before forwarding", async () => {
     assert.match(calls[0]?.url ?? "", /^https:\/\/api\.x\.com\/2\/tweets\/42\?/);
     assert.equal(calls[1]?.url, runtime.slackWebhookUrl);
     assert.deepEqual(JSON.parse(calls[1]?.body ?? ""), {
-      text: "https://x.com/lookup_user/status/42",
+      text: "https://fixupx.com/lookup_user/status/42",
       unfurl_links: true,
       unfurl_media: true,
     });

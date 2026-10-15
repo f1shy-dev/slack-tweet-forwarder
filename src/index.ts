@@ -410,7 +410,7 @@ export class DedupeStore {
 }
 
 export function slackMessage(post: XPost): string {
-  const link = `https://x.com/${encodeURIComponent(post.username)}/status/${encodeURIComponent(post.id)}`;
+  const link = `https://fixupx.com/${encodeURIComponent(post.username)}/status/${encodeURIComponent(post.id)}`;
   return link;
 }
 
