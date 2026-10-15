@@ -263,9 +263,31 @@ test("forwards a captured stream post when classification is disabled and suppre
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.url, runtime.slackWebhookUrl);
     assert.deepEqual(JSON.parse(calls[0]?.body ?? ""), {
-      text: "https://x.com/vishyfishy2/status/2065839641417138368",
-      unfurl_links: true,
-      unfurl_media: true,
+      text: "vishyfishy2 (@vishyfishy2): meow\nhttps://x.com/vishyfishy2/status/2065839641417138368",
+      blocks: [
+        {
+          type: "container",
+          title: { type: "plain_text", text: "vishyfishy2" },
+          subtitle: { type: "plain_text", text: "@vishyfishy2" },
+          width: "standard",
+          has_header_divider: true,
+          child_blocks: [
+            { type: "section", text: { type: "plain_text", text: "meow" } },
+            {
+              type: "context",
+              elements: [
+                {
+                  type: "mrkdwn",
+                  text: "<https://x.com/vishyfishy2/status/2065839641417138368|View on X>",
+                  verbatim: true,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+      unfurl_links: false,
+      unfurl_media: false,
     });
     const dedupeFile: unknown = JSON.parse(await readFile(runtime.dedupePath, "utf8"));
     assert.equal(typeof dedupeFile, "object");
@@ -434,9 +456,31 @@ test("looks up incomplete stream events before forwarding", async () => {
     assert.match(calls[0]?.url ?? "", /^https:\/\/api\.x\.com\/2\/tweets\/42\?/);
     assert.equal(calls[1]?.url, runtime.slackWebhookUrl);
     assert.deepEqual(JSON.parse(calls[1]?.body ?? ""), {
-      text: "https://x.com/lookup_user/status/42",
-      unfurl_links: true,
-      unfurl_media: true,
+      text: "lookup_user (@lookup_user): lookup text\nhttps://x.com/lookup_user/status/42",
+      blocks: [
+        {
+          type: "container",
+          title: { type: "plain_text", text: "lookup_user" },
+          subtitle: { type: "plain_text", text: "@lookup_user" },
+          width: "standard",
+          has_header_divider: true,
+          child_blocks: [
+            { type: "section", text: { type: "plain_text", text: "lookup text" } },
+            {
+              type: "context",
+              elements: [
+                {
+                  type: "mrkdwn",
+                  text: "<https://x.com/lookup_user/status/42|View on X>",
+                  verbatim: true,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+      unfurl_links: false,
+      unfurl_media: false,
     });
   });
 });

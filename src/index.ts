@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { hydratePosts, refetchMetrics, rehydrateEvents, type Hydrated } from "./ingest.js";
 import { PostStore, type StoredEvent, type StreamSource } from "./store.js";
 import { authorUsername, fullText } from "./x.js";
+import { slackPayload } from "./slack.js";
 
 const modelId = "gemini-3.1-flash-lite";
 const dedupeTtlMs = 60 * 60 * 24 * 1000;
@@ -40,6 +41,7 @@ export type ForwardOutcome =
   | "classifier-unavailable";
 
 export type PostCandidate = {
+  hydrated?: Hydrated;
   id: string;
   text: string | null;
   username: string | null;
@@ -439,17 +441,26 @@ async function shouldForwardToSlack(
   return output === "send";
 }
 
-async function postToSlack(post: XPost, webhookUrl: string): Promise<void> {
+async function postToSlack(post: XPost, webhookUrl: string, hydrated?: Hydrated): Promise<void> {
+  const payload = slackPayload(post, hydrated);
   const response = await fetch(webhookUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      text: slackMessage(post),
-      unfurl_links: true,
-      unfurl_media: true,
-    }),
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(15_000),
   });
 
+  if (response.status === 400 && (await response.text()).includes("invalid_blocks")) {
+    console.warn("Slack rejected tweet card; sending text fallback", { postId: post.id });
+    const fallback = await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: payload.text, unfurl_links: false, unfurl_media: false }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!fallback.ok) throw new Error(`Slack webhook returned ${fallback.status}`);
+    return;
+  }
   if (!response.ok) {
     throw new Error(`Slack webhook returned ${response.status}`);
   }
@@ -576,7 +587,7 @@ async function processCandidate(
   }
 
   console.info("Posting X post to Slack", postSummary(post));
-  await postToSlack(post, runtime.slackWebhookUrl);
+  await postToSlack(post, runtime.slackWebhookUrl, candidate.hydrated);
   console.info("Slack webhook accepted X post", postSummary(post));
   await dedupe.put(post.id);
   return "posted";
@@ -632,6 +643,7 @@ export function enrichCandidate(
     id: candidate.id,
     text: fullText(hydrated.post) ?? candidate.text,
     username: authorUsername(hydrated.post, hydrated.includes) ?? candidate.username,
+    hydrated,
   };
 }
 
